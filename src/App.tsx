@@ -1,34 +1,141 @@
-import { useState } from 'react'
-import reactLogo from './assets/react.svg'
-import viteLogo from '/vite.svg'
-import './App.css'
+import { useCallback, useEffect, useState } from 'react'
+import { Header } from './components/Header'
+import { UploadZone } from './components/UploadZone'
+import { Progress } from './components/Progress'
+import { DoneScreen } from './components/DoneScreen'
+import { buildMediaItems } from './lib/metadata'
+import { convertHeicFiles, isHeic } from './lib/convertHeic'
+import { stitchMedia } from './lib/pipeline'
+import { saveBlob } from './lib/download'
+import type { AppPhase } from './lib/types'
 
 function App() {
-  const [count, setCount] = useState(0)
+  const [phase, setPhase] = useState<AppPhase>({ name: 'idle' })
+
+  // Revoke any object URL when leaving the done state.
+  useEffect(() => {
+    return () => {
+      if (phase.name === 'done') URL.revokeObjectURL(phase.url)
+    }
+  }, [phase])
+
+  const handleFiles = useCallback(async (files: File[]) => {
+    try {
+      const heicCount = files.filter(isHeic).length
+      if (heicCount > 0) {
+        setPhase({ name: 'converting', total: heicCount, current: 0 })
+      }
+      const prepared = await convertHeicFiles(files, ({ current, total }) => {
+        setPhase({ name: 'converting', total, current })
+      })
+      setPhase({ name: 'sorting', total: prepared.length })
+      const items = await buildMediaItems(prepared)
+      if (items.length === 0) {
+        setPhase({
+          name: 'error',
+          message: 'No supported images or videos found in your selection.',
+        })
+        return
+      }
+      setPhase({
+        name: 'stitching',
+        total: items.length + 1,
+        current: 0,
+        ratio: 0,
+      })
+      const blob = await stitchMedia(items, ({ current, total, ratio }) => {
+        setPhase({ name: 'stitching', total, current, ratio })
+      })
+      const url = URL.createObjectURL(blob)
+      setPhase({ name: 'done', blob, url })
+    } catch (err) {
+      console.error(err)
+      const message =
+        err instanceof Error ? err.message : 'Something went wrong.'
+      let details: string
+      if (err instanceof Error) {
+        details = err.stack ?? `${err.name}: ${err.message}`
+      } else {
+        try {
+          details = JSON.stringify(err, null, 2)
+        } catch {
+          details = String(err)
+        }
+      }
+      setPhase({ name: 'error', message, details })
+    }
+  }, [])
+
+  const reset = useCallback(() => setPhase({ name: 'idle' }), [])
 
   return (
-    <>
-      <div>
-        <a href="https://vite.dev" target="_blank">
-          <img src={viteLogo} className="logo" alt="Vite logo" />
-        </a>
-        <a href="https://react.dev" target="_blank">
-          <img src={reactLogo} className="logo react" alt="React logo" />
-        </a>
-      </div>
-      <h1>Vite + React</h1>
-      <div className="card">
-        <button onClick={() => setCount((count) => count + 1)}>
-          count is {count}
-        </button>
-        <p>
-          Edit <code>src/App.tsx</code> and save to test HMR
-        </p>
-      </div>
-      <p className="read-the-docs">
-        Click on the Vite and React logos to learn more
-      </p>
-    </>
+    <div className="min-h-full w-full bg-neutral-50">
+      <main className="mx-auto max-w-3xl px-6 py-16 sm:py-24">
+        <Header />
+
+        {phase.name === 'idle' && <UploadZone onFiles={handleFiles} />}
+
+        {phase.name === 'converting' && (
+          <Progress
+            label="Converting HEIC photos..."
+            current={phase.current}
+            total={phase.total}
+            ratio={1}
+          />
+        )}
+
+        {phase.name === 'sorting' && (
+          <Progress
+            label="Reading metadata and sorting..."
+            current={1}
+            total={phase.total}
+            ratio={0.5}
+          />
+        )}
+
+        {phase.name === 'stitching' && (
+          <Progress
+            label={
+              phase.current >= phase.total
+                ? 'Wrapping up...'
+                : 'Stitching your video...'
+            }
+            current={phase.current}
+            total={phase.total}
+            ratio={phase.ratio}
+          />
+        )}
+
+        {phase.name === 'done' && (
+          <DoneScreen
+            videoUrl={phase.url}
+            onSave={() => saveBlob(phase.blob, 'easy-vlog.mp4')}
+            onReset={reset}
+          />
+        )}
+
+        {phase.name === 'error' && (
+          <div className="rounded-2xl border border-red-200 bg-red-50 px-8 py-10 text-center">
+            <h3 className="text-lg font-semibold text-red-700">
+              Something went wrong
+            </h3>
+            <p className="mt-2 text-red-600">{phase.message}</p>
+            {phase.details && (
+              <pre className="mt-4 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-red-100 p-3 text-left text-xs text-red-900 select-all">
+                {phase.details}
+              </pre>
+            )}
+            <button
+              type="button"
+              onClick={reset}
+              className="mt-6 rounded-full bg-emerald-500 px-6 py-2 text-white font-medium hover:bg-emerald-400 transition-colors"
+            >
+              Try again
+            </button>
+          </div>
+        )}
+      </main>
+    </div>
   )
 }
 
