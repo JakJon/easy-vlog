@@ -7,6 +7,7 @@ import { buildMediaItems } from './lib/metadata'
 import { convertHeicFiles, isHeic } from './lib/convertHeic'
 import { stitchMedia } from './lib/pipeline'
 import { saveBlob } from './lib/download'
+import { checkWebCodecsCapability, summarize } from './lib/webcodecsCapability'
 import type { AppPhase } from './lib/types'
 
 function App() {
@@ -18,6 +19,14 @@ function App() {
       if (phase.name === 'done') URL.revokeObjectURL(phase.url)
     }
   }, [phase])
+
+  // One-shot WebCodecs capability probe on mount; logs to console.
+  useEffect(() => {
+    checkWebCodecsCapability().then((cap) => {
+      console.log('[webcodecs] capability:\n' + summarize(cap))
+      console.log('[webcodecs] raw:', cap)
+    })
+  }, [])
 
   const handleFiles = useCallback(async (files: File[]) => {
     try {
