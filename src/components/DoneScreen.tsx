@@ -22,7 +22,7 @@ export function DoneScreen({ videoUrl, onSave, onReset }: Props) {
         onClick={onSave}
         className="mt-8 inline-flex items-center gap-2 rounded-full bg-emerald-500 px-10 py-4 text-lg font-semibold text-white shadow-[0_0_30px_rgba(16,185,129,0.55)] hover:bg-emerald-400 active:bg-emerald-600 focus:outline-none focus-visible:ring-4 focus-visible:ring-emerald-300 transition-colors"
       >
-        Save to your computer
+        Save
       </button>
 
       <div className="mt-10 border-t border-neutral-100 pt-6">

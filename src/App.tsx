@@ -5,13 +5,14 @@ import { Progress } from './components/Progress'
 import { DoneScreen } from './components/DoneScreen'
 import { buildMediaItems } from './lib/metadata'
 import { convertHeicFiles, isHeic } from './lib/convertHeic'
-import { stitchMedia } from './lib/pipeline'
+import { stitchMedia, isWebCodecsSupported } from './lib/pipeline'
 import { saveBlob } from './lib/download'
 import { checkWebCodecsCapability, summarize } from './lib/webcodecsCapability'
 import type { AppPhase } from './lib/types'
 
 function App() {
   const [phase, setPhase] = useState<AppPhase>({ name: 'idle' })
+  const webCodecsSupported = isWebCodecsSupported()
 
   // Revoke any object URL when leaving the done state.
   useEffect(() => {
@@ -82,7 +83,26 @@ function App() {
       <main className="mx-auto max-w-3xl px-6 py-16 sm:py-24">
         <Header />
 
-        {phase.name === 'idle' && <UploadZone onFiles={handleFiles} />}
+        {phase.name === 'idle' && webCodecsSupported && (
+          <UploadZone onFiles={handleFiles} />
+        )}
+
+        {phase.name === 'idle' && !webCodecsSupported && (
+          <div className="rounded-2xl border border-amber-200 bg-amber-50 px-8 py-10 text-center">
+            <h3 className="text-lg font-semibold text-amber-800">
+              Browser not supported
+            </h3>
+            <p className="mt-3 text-amber-700">
+              Easy Vlog stitches your video entirely in the browser using
+              WebCodecs, which this browser doesn&apos;t expose.
+            </p>
+            <p className="mt-2 text-amber-700">
+              Open this page on a desktop in the latest Chrome or Edge to get
+              started. Mobile Safari and some Android browsers don&apos;t yet
+              support the API.
+            </p>
+          </div>
+        )}
 
         {phase.name === 'converting' && (
           <Progress
@@ -144,6 +164,9 @@ function App() {
           </div>
         )}
       </main>
+      <footer className="pb-6 text-center text-xs text-neutral-400">
+        v1.01
+      </footer>
     </div>
   )
 }

@@ -31,6 +31,7 @@ export async function stitchMedia(
   onProgress: (p: StitchProgress) => void,
 ): Promise<Blob> {
   if (items.length === 0) throw new Error('No media items to stitch.')
+  assertWebCodecsAvailable()
 
   const muxer = new Muxer({
     target: new ArrayBufferTarget(),
@@ -276,20 +277,35 @@ async function processVideo(
   // Read file once so we can use the raw bytes for codec description AND
   // for audio decoding without re-reading.
   const fileBytes = await opts.file.arrayBuffer()
-  const [videoResult, audioResult] = await Promise.all([
-    processVideoFrames(opts, fileBytes),
-    processVideoAudio(opts, fileBytes),
+
+  // Compute the per-clip target length up-front so video and audio cover the
+  // EXACT same wall-clock duration. Without this, video emits one frame per
+  // decoded source frame (so duration scales with source fps) while audio
+  // tracks the source's real duration — and they drift across clips.
+  let durationS = await readVideoDurationSeconds(opts.file).catch(() => 0)
+  if (!Number.isFinite(durationS) || durationS <= 0) durationS = 5
+  const targetFrames = Math.max(1, Math.round(durationS * TARGET_FPS))
+  // 48000 / 30 = 1600 exactly, so this is always an integer.
+  const targetAudioSamples = (targetFrames * TARGET_SAMPLE_RATE) / TARGET_FPS
+
+  await Promise.all([
+    processVideoFrames(opts, fileBytes, targetFrames),
+    processVideoAudio(opts, fileBytes, targetAudioSamples),
   ])
-  return { videoTsUs: videoResult, audioSamples: audioResult }
+  return {
+    videoTsUs: opts.videoStartUs + targetFrames * FRAME_DURATION_US,
+    audioSamples: opts.audioStartSamples + targetAudioSamples,
+  }
 }
 
 async function processVideoFrames(
   opts: VideoOpts,
   fileBytes: ArrayBuffer,
-): Promise<number> {
+  targetFrames: number,
+): Promise<void> {
   const { ctx, canvas, videoEncoder, videoStartUs, tickUs, propagate, errBox } = opts
 
-  return new Promise<number>((resolve, reject) => {
+  return new Promise<void>((resolve, reject) => {
     let framesEmitted = 0
     let framesDecoded = 0
     let chunksDecoded = 0
@@ -315,6 +331,13 @@ async function processVideoFrames(
     // serializes work and lets us await waitForVideoQueue between frames
     // without blocking the decoder thread.
     let drawTail: Promise<void> = Promise.resolve()
+    // Rate conversion: each decoded source frame is mapped to the closest
+    // 30 fps slot. lastEmittedSlot is the highest slot index already encoded;
+    // sourceStartUs is the presentation timestamp of the first decoded frame
+    // (some files start at non-zero cts, e.g. iPhone HEVC).
+    let sourceStartUs: number | null = null
+    let lastEmittedSlot = -1
+    let canvasHasContent = false
 
     const mp4 = createFile()
 
@@ -402,26 +425,51 @@ async function processVideoFrames(
                   return
                 }
                 // Chain the encode step onto drawTail so we can apply
-                // encoder-queue backpressure asynchronously.
+                // encoder-queue backpressure asynchronously and serialize
+                // canvas writes with VideoFrame snapshots.
                 drawTail = drawTail.then(async () => {
                   try {
                     if (errBox.err) {
                       frame.close()
                       return
                     }
+                    if (sourceStartUs === null) sourceStartUs = frame.timestamp
+                    const elapsedUs = frame.timestamp - sourceStartUs
+                    // Map this source frame to its nearest 30 fps slot, but
+                    // never emit beyond targetFrames-1 (would desync against
+                    // audio).
+                    const targetSlot = Math.min(
+                      targetFrames - 1,
+                      Math.max(0, Math.round(elapsedUs / FRAME_DURATION_US)),
+                    )
+                    if (targetSlot <= lastEmittedSlot) {
+                      // Source has more frames than the 30 fps grid needs
+                      // (e.g. 60 fps source). Drop this frame.
+                      frame.close()
+                      return
+                    }
                     drawContain(ctx, frame, canvas.width, canvas.height, rotation)
                     frame.close()
-                    await waitForVideoQueue(videoEncoder)
-                    if (errBox.err) return
-                    const ts = videoStartUs + framesEmitted * FRAME_DURATION_US
-                    const out = new VideoFrame(canvas, {
-                      timestamp: ts,
-                      duration: FRAME_DURATION_US,
-                    })
-                    videoEncoder.encode(out, { keyFrame: framesEmitted === 0 })
-                    out.close()
-                    framesEmitted++
-                    tickUs(FRAME_DURATION_US)
+                    canvasHasContent = true
+                    // Emit one output frame for every slot from lastEmittedSlot+1
+                    // through targetSlot inclusive, all sourced from the canvas
+                    // we just drew. For low-fps sources this duplicates the new
+                    // frame across slots that have no matching source frame.
+                    for (let slot = lastEmittedSlot + 1; slot <= targetSlot; slot++) {
+                      if (errBox.err) return
+                      await waitForVideoQueue(videoEncoder)
+                      if (errBox.err) return
+                      const ts = videoStartUs + slot * FRAME_DURATION_US
+                      const out = new VideoFrame(canvas, {
+                        timestamp: ts,
+                        duration: FRAME_DURATION_US,
+                      })
+                      videoEncoder.encode(out, { keyFrame: slot === 0 })
+                      out.close()
+                      framesEmitted++
+                      tickUs(FRAME_DURATION_US)
+                    }
+                    lastEmittedSlot = targetSlot
                   } catch (e) {
                     propagate(e)
                   }
@@ -497,13 +545,7 @@ async function processVideoFrames(
         // dec.flush() only guarantees decoder output callbacks have fired, not
         // that the chained encode work has completed.
         await drawTail
-        console.log('[webcodecs] processVideoFrames done', {
-          chunksDecoded,
-          framesDecoded,
-          framesEmitted,
-          configured,
-          hasVideoTrack,
-        })
+
         if (hasVideoTrack && framesEmitted === 0) {
           throw new Error(
             'Video track decoded 0 frames. The browser configured a decoder ' +
@@ -511,7 +553,41 @@ async function processVideoFrames(
               'profile/tier or a corrupt bitstream.',
           )
         }
-        resolve(videoStartUs + framesEmitted * FRAME_DURATION_US)
+
+        // Pad to targetFrames if the source ran short of the wall-clock
+        // duration we promised the audio side. If we have a video track but
+        // no canvas content (no track is the only realistic way framesEmitted
+        // == 0, and that's already thrown above), fill black.
+        if (lastEmittedSlot < targetFrames - 1) {
+          if (!canvasHasContent) {
+            ctx.fillStyle = 'black'
+            ctx.fillRect(0, 0, canvas.width, canvas.height)
+          }
+          for (let slot = lastEmittedSlot + 1; slot < targetFrames; slot++) {
+            if (errBox.err) throw errBox.err
+            await waitForVideoQueue(videoEncoder)
+            const ts = videoStartUs + slot * FRAME_DURATION_US
+            const out = new VideoFrame(canvas, {
+              timestamp: ts,
+              duration: FRAME_DURATION_US,
+            })
+            videoEncoder.encode(out, { keyFrame: slot === 0 })
+            out.close()
+            framesEmitted++
+            tickUs(FRAME_DURATION_US)
+          }
+          lastEmittedSlot = targetFrames - 1
+        }
+
+        console.log('[webcodecs] processVideoFrames done', {
+          chunksDecoded,
+          framesDecoded,
+          framesEmitted,
+          targetFrames,
+          configured,
+          hasVideoTrack,
+        })
+        resolve()
       } catch (e) {
         console.error('[webcodecs] decode pipeline failed', e)
         reject(e instanceof Error ? e : new Error(String(e)))
@@ -523,12 +599,13 @@ async function processVideoFrames(
 async function processVideoAudio(
   opts: VideoOpts,
   fileBytes: ArrayBuffer,
-): Promise<number> {
-  const { file, audioEncoder, audioStartSamples, errBox } = opts
+  targetAudioSamples: number,
+): Promise<void> {
+  const { audioEncoder, audioStartSamples, errBox } = opts
 
   // Decode the entire audio track from the input file via Web Audio.
   // This handles AAC/MP4 natively and resamples to TARGET_SAMPLE_RATE.
-  let decoded: AudioBuffer
+  let decoded: AudioBuffer | null = null
   try {
     decoded = await decodeAndResampleAudio(
       fileBytes,
@@ -537,12 +614,17 @@ async function processVideoAudio(
     )
   } catch (e) {
     console.warn('[webcodecs] audio decode failed, substituting silence', e)
-    // No audio or decode failed — emit silence covering the video duration.
-    const seconds = await readVideoDurationSeconds(file).catch(() => 0)
-    return emitSilence(opts.audioEncoder, audioStartSamples, Math.round(seconds * TARGET_SAMPLE_RATE))
   }
 
-  const totalSamples = decoded.length
+  if (!decoded) {
+    // No audio (or decode failed) — fill the entire target with silence.
+    await emitSilence(audioEncoder, audioStartSamples, targetAudioSamples)
+    return
+  }
+
+  // Trim to target if source is longer; pad with silence at the end if shorter.
+  // This keeps each clip's audio duration locked to its video duration.
+  const samplesToEmit = Math.min(decoded.length, targetAudioSamples)
   const channelData: Float32Array[] = []
   for (let ch = 0; ch < TARGET_AUDIO_CHANNELS; ch++) {
     const srcCh = ch < decoded.numberOfChannels ? ch : 0
@@ -550,9 +632,9 @@ async function processVideoAudio(
   }
 
   let offset = 0
-  while (offset < totalSamples) {
+  while (offset < samplesToEmit) {
     if (errBox.err) throw errBox.err
-    const samples = Math.min(AUDIO_CHUNK_SAMPLES, totalSamples - offset)
+    const samples = Math.min(AUDIO_CHUNK_SAMPLES, samplesToEmit - offset)
     const interleaved = new Float32Array(samples * TARGET_AUDIO_CHANNELS)
     for (let i = 0; i < samples; i++) {
       for (let ch = 0; ch < TARGET_AUDIO_CHANNELS; ch++) {
@@ -573,7 +655,10 @@ async function processVideoAudio(
     audioData.close()
     offset += samples
   }
-  return audioStartSamples + totalSamples
+
+  if (offset < targetAudioSamples) {
+    await emitSilence(audioEncoder, audioStartSamples + offset, targetAudioSamples - offset)
+  }
 }
 
 async function emitSilence(
@@ -888,6 +973,28 @@ async function waitForAudioQueue(encoder: AudioEncoder): Promise<void> {
   while (encoder.encodeQueueSize > 8) {
     await new Promise((r) => setTimeout(r, 0))
   }
+}
+
+// WebCodecs feature detection. Mobile Safari and some older Android browsers
+// don't ship VideoEncoder; the rest of the pipeline crashes with an opaque
+// ReferenceError if we don't gate.
+export function isWebCodecsSupported(): boolean {
+  const g = globalThis as Record<string, unknown>
+  return (
+    typeof g.VideoEncoder !== 'undefined' &&
+    typeof g.VideoDecoder !== 'undefined' &&
+    typeof g.AudioEncoder !== 'undefined' &&
+    typeof g.AudioDecoder !== 'undefined'
+  )
+}
+
+function assertWebCodecsAvailable(): void {
+  if (isWebCodecsSupported()) return
+  throw new Error(
+    "Your browser doesn't support WebCodecs, which Easy Vlog needs to " +
+      'stitch video. Try the latest desktop Chrome or Edge — mobile Safari ' +
+      "and some Android browsers don't yet expose this API.",
+  )
 }
 
 // Re-export so callers that previously imported from this module still work.
