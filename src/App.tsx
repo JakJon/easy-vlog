@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { Header } from './components/Header'
 import { UploadZone } from './components/UploadZone'
+import { Options } from './components/Options'
 import { Progress } from './components/Progress'
 import { DoneScreen } from './components/DoneScreen'
 import { buildMediaItems } from './lib/metadata'
@@ -8,10 +9,15 @@ import { convertHeicFiles, isHeic } from './lib/convertHeic'
 import { stitchMedia, isWebCodecsSupported } from './lib/pipeline'
 import { saveBlob } from './lib/download'
 import { checkWebCodecsCapability, summarize } from './lib/webcodecsCapability'
-import type { AppPhase } from './lib/types'
+import { DEFAULT_STITCH_OPTIONS, type AppPhase, type StitchOptions } from './lib/types'
 
 function App() {
   const [phase, setPhase] = useState<AppPhase>({ name: 'idle' })
+  const [options, setOptions] = useState<StitchOptions>(DEFAULT_STITCH_OPTIONS)
+  // Stitching is async; capture the latest options at the moment upload starts
+  // so changes mid-flight don't retarget the in-progress encode.
+  const optionsRef = useRef(options)
+  optionsRef.current = options
   const webCodecsSupported = isWebCodecsSupported()
 
   // Revoke any object URL when leaving the done state.
@@ -53,7 +59,7 @@ function App() {
         current: 0,
         ratio: 0,
       })
-      const blob = await stitchMedia(items, ({ current, total, ratio }) => {
+      const blob = await stitchMedia(items, optionsRef.current, ({ current, total, ratio }) => {
         setPhase({ name: 'stitching', total, current, ratio })
       })
       const url = URL.createObjectURL(blob)
@@ -84,7 +90,10 @@ function App() {
         <Header />
 
         {phase.name === 'idle' && webCodecsSupported && (
-          <UploadZone onFiles={handleFiles} />
+          <>
+            <Options value={options} onChange={setOptions} />
+            <UploadZone onFiles={handleFiles} />
+          </>
         )}
 
         {phase.name === 'idle' && !webCodecsSupported && (
@@ -125,7 +134,7 @@ function App() {
         {phase.name === 'stitching' && (
           <Progress
             label={
-              phase.current >= phase.total
+              phase.ratio >= 1
                 ? 'Wrapping up...'
                 : 'Stitching your video...'
             }
@@ -165,7 +174,7 @@ function App() {
         )}
       </main>
       <footer className="pb-6 text-center text-xs text-neutral-400">
-        v1.01
+        v1.1
       </footer>
     </div>
   )

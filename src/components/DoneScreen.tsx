@@ -14,7 +14,7 @@ export function DoneScreen({ videoUrl, onSave, onReset }: Props) {
       <video
         src={videoUrl}
         controls
-        className="mt-6 mx-auto w-full max-w-2xl rounded-xl bg-black"
+        className="mt-6 mx-auto max-h-[70vh] w-auto max-w-full rounded-xl bg-black"
       />
 
       <button

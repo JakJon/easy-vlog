@@ -1,9 +1,11 @@
 import { createFile, DataStream, Endianness, type MP4BoxBuffer, type Sample } from 'mp4box'
 import { Muxer, ArrayBufferTarget } from 'mp4-muxer'
-import type { MediaItem } from './types'
+import type { MediaItem, StitchOptions } from './types'
 
-const TARGET_W = 1920
-const TARGET_H = 1080
+const LANDSCAPE_W = 1920
+const LANDSCAPE_H = 1080
+const PORTRAIT_W = 1080
+const PORTRAIT_H = 1920
 const TARGET_FPS = 30
 const FRAME_DURATION_US = Math.round(1_000_000 / TARGET_FPS)
 const TARGET_VIDEO_CODEC = 'avc1.640028' // H.264 High @ Level 4
@@ -12,8 +14,6 @@ const TARGET_SAMPLE_RATE = 48_000
 const TARGET_AUDIO_CHANNELS = 2
 const TARGET_AUDIO_BITRATE = 128_000
 const TARGET_AUDIO_CODEC = 'mp4a.40.2' // AAC LC
-const IMAGE_DURATION_SECONDS = 3
-const IMAGE_VIDEO_FRAMES = TARGET_FPS * IMAGE_DURATION_SECONDS
 const AUDIO_CHUNK_SAMPLES = 1024 // matches AAC LC frame size
 
 export interface StitchProgress {
@@ -28,18 +28,24 @@ interface AsyncErrorBox {
 
 export async function stitchMedia(
   items: MediaItem[],
+  options: StitchOptions,
   onProgress: (p: StitchProgress) => void,
 ): Promise<Blob> {
   if (items.length === 0) throw new Error('No media items to stitch.')
   assertWebCodecsAvailable()
+
+  const targetW = options.orientation === 'portrait' ? PORTRAIT_W : LANDSCAPE_W
+  const targetH = options.orientation === 'portrait' ? PORTRAIT_H : LANDSCAPE_H
+  const imageDurationSeconds = Math.max(0.1, options.imageDurationSeconds)
+  const imageVideoFrames = Math.max(1, Math.round(TARGET_FPS * imageDurationSeconds))
 
   const muxer = new Muxer({
     target: new ArrayBufferTarget(),
     fastStart: 'in-memory',
     video: {
       codec: 'avc',
-      width: TARGET_W,
-      height: TARGET_H,
+      width: targetW,
+      height: targetH,
       frameRate: TARGET_FPS,
     },
     audio: {
@@ -76,8 +82,8 @@ export async function stitchMedia(
   })
   videoEncoder.configure({
     codec: TARGET_VIDEO_CODEC,
-    width: TARGET_W,
-    height: TARGET_H,
+    width: targetW,
+    height: targetH,
     bitrate: TARGET_VIDEO_BITRATE,
     framerate: TARGET_FPS,
     // 'no-preference' lets the browser pick. On Windows the H.264 hardware
@@ -103,7 +109,7 @@ export async function stitchMedia(
     bitrate: TARGET_AUDIO_BITRATE,
   })
 
-  const canvas = new OffscreenCanvas(TARGET_W, TARGET_H)
+  const canvas = new OffscreenCanvas(targetW, targetH)
   const ctx = canvas.getContext('2d', { alpha: false })
   if (!ctx) throw new Error('Failed to acquire 2D canvas context')
 
@@ -111,7 +117,7 @@ export async function stitchMedia(
   const itemDurations: number[] = []
   for (const item of items) {
     if (item.kind === 'image') {
-      itemDurations.push(IMAGE_DURATION_SECONDS)
+      itemDurations.push(imageDurationSeconds)
     } else {
       try {
         itemDurations.push(await readVideoDurationSeconds(item.file))
@@ -122,7 +128,7 @@ export async function stitchMedia(
   }
   const totalUs = Math.max(1, Math.round(itemDurations.reduce((a, b) => a + b, 0) * 1_000_000))
   let processedUs = 0
-  const total = items.length + 1
+  const total = items.length
   let lastReported = -1
   const reportProgress = (current: number) => {
     const ratio = Math.min(1, processedUs / totalUs)
@@ -149,14 +155,16 @@ export async function stitchMedia(
           audioEncoder,
           videoStartUs: outputVideoUs,
           audioStartSamples: outputAudioSamples,
+          imageDurationSeconds,
+          imageVideoFrames,
           tickUs: () => {
             processedUs += FRAME_DURATION_US
             reportProgress(i + 1)
           },
           errBox,
         })
-        outputVideoUs += IMAGE_VIDEO_FRAMES * FRAME_DURATION_US
-        outputAudioSamples += TARGET_SAMPLE_RATE * IMAGE_DURATION_SECONDS
+        outputVideoUs += imageVideoFrames * FRAME_DURATION_US
+        outputAudioSamples += Math.round(TARGET_SAMPLE_RATE * imageDurationSeconds)
       } else {
         const result = await processVideo({
           file: item.file,
@@ -210,12 +218,26 @@ interface ImageOpts {
   audioEncoder: AudioEncoder
   videoStartUs: number
   audioStartSamples: number
+  imageDurationSeconds: number
+  imageVideoFrames: number
   tickUs: () => void
   errBox: AsyncErrorBox
 }
 
 async function processImage(opts: ImageOpts): Promise<void> {
-  const { file, ctx, canvas, videoEncoder, audioEncoder, videoStartUs, audioStartSamples, tickUs, errBox } = opts
+  const {
+    file,
+    ctx,
+    canvas,
+    videoEncoder,
+    audioEncoder,
+    videoStartUs,
+    audioStartSamples,
+    imageDurationSeconds,
+    imageVideoFrames,
+    tickUs,
+    errBox,
+  } = opts
   const bitmap = await createImageBitmap(file)
   try {
     drawContain(ctx, bitmap, canvas.width, canvas.height, 0)
@@ -223,7 +245,7 @@ async function processImage(opts: ImageOpts): Promise<void> {
     bitmap.close()
   }
 
-  for (let f = 0; f < IMAGE_VIDEO_FRAMES; f++) {
+  for (let f = 0; f < imageVideoFrames; f++) {
     if (errBox.err) throw errBox.err
     await waitForVideoQueue(videoEncoder)
     const ts = videoStartUs + f * FRAME_DURATION_US
@@ -233,8 +255,8 @@ async function processImage(opts: ImageOpts): Promise<void> {
     tickUs()
   }
 
-  // Silence at TARGET_SAMPLE_RATE × TARGET_AUDIO_CHANNELS for IMAGE_DURATION_SECONDS.
-  const totalSamples = TARGET_SAMPLE_RATE * IMAGE_DURATION_SECONDS
+  // Silence at TARGET_SAMPLE_RATE × TARGET_AUDIO_CHANNELS for the configured per-image duration.
+  const totalSamples = Math.round(TARGET_SAMPLE_RATE * imageDurationSeconds)
   let offset = 0
   while (offset < totalSamples) {
     if (errBox.err) throw errBox.err
