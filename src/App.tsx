@@ -14,6 +14,7 @@ import { DEFAULT_STITCH_OPTIONS, type AppPhase, type StitchOptions } from './lib
 function App() {
   const [phase, setPhase] = useState<AppPhase>({ name: 'idle' })
   const [options, setOptions] = useState<StitchOptions>(DEFAULT_STITCH_OPTIONS)
+  const [mobileOptionsOpen, setMobileOptionsOpen] = useState(false)
   // Stitching is async; capture the latest options at the moment upload starts
   // so changes mid-flight don't retarget the in-progress encode.
   const optionsRef = useRef(options)
@@ -91,8 +92,41 @@ function App() {
 
         {phase.name === 'idle' && webCodecsSupported && (
           <>
-            <Options value={options} onChange={setOptions} />
             <UploadZone onFiles={handleFiles} />
+            <div className="hidden sm:block mt-4">
+              <Options value={options} onChange={setOptions} />
+            </div>
+            <div className="sm:hidden mt-4 rounded-2xl border border-neutral-200 bg-white">
+              <button
+                type="button"
+                onClick={() => setMobileOptionsOpen((v) => !v)}
+                aria-expanded={mobileOptionsOpen}
+                aria-controls="mobile-options-panel"
+                className="flex w-full items-center justify-between px-6 py-4 text-left"
+              >
+                <span className="text-sm font-medium text-neutral-700">
+                  Options
+                </span>
+                <span
+                  aria-hidden="true"
+                  className={`text-neutral-400 transition-transform duration-200 ${
+                    mobileOptionsOpen ? 'rotate-180' : ''
+                  }`}
+                >
+                  ▾
+                </span>
+              </button>
+              <div
+                id="mobile-options-panel"
+                className={`grid overflow-hidden transition-[grid-template-rows] duration-300 ease-out ${
+                  mobileOptionsOpen ? 'grid-rows-[1fr]' : 'grid-rows-[0fr]'
+                }`}
+              >
+                <div className="min-h-0 overflow-hidden">
+                  <Options value={options} onChange={setOptions} bare />
+                </div>
+              </div>
+            </div>
           </>
         )}
 
@@ -174,7 +208,7 @@ function App() {
         )}
       </main>
       <footer className="pb-6 text-center text-xs text-neutral-400">
-        v1.1
+        v1.1.1
       </footer>
     </div>
   )

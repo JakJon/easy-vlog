@@ -8,9 +8,12 @@ import {
 interface Props {
   value: StitchOptions
   onChange: (next: StitchOptions) => void
+  // When true, omit the outer card chrome — caller is providing its own
+  // container (e.g. the mobile accordion shares a card with the toggle).
+  bare?: boolean
 }
 
-export function Options({ value, onChange }: Props) {
+export function Options({ value, onChange, bare = false }: Props) {
   const setOrientation = (orientation: Orientation) =>
     onChange({ ...value, orientation })
 
@@ -22,9 +25,13 @@ export function Options({ value, onChange }: Props) {
     onChange({ ...value, imageDurationSeconds: clamped })
   }
 
+  const wrapperClass = bare
+    ? 'px-6 pb-5'
+    : 'rounded-2xl border border-neutral-200 bg-white px-6 py-5'
+
   return (
-    <div className="rounded-2xl border border-neutral-200 bg-white px-6 py-5 mb-4">
-      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+    <div className={wrapperClass}>
+      <div className="flex flex-col items-center gap-4 sm:flex-row sm:justify-between">
         <div className="flex items-center gap-3">
           <span className="text-sm font-medium text-neutral-700">
             Orientation
