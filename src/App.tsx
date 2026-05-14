@@ -2,19 +2,23 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { Header } from './components/Header'
 import { UploadZone } from './components/UploadZone'
 import { Options } from './components/Options'
+import { DiagnosticsPanel } from './components/DiagnosticsPanel'
+import { GooglePhotosButton } from './components/GooglePhotosButton'
+import type { PickedMedia } from './lib/googlePhotosPicker'
 import { Progress } from './components/Progress'
 import { DoneScreen } from './components/DoneScreen'
-import { buildMediaItems } from './lib/metadata'
+import { buildMediaItems, type SortDiagnosticRow } from './lib/metadata'
 import { convertHeicFiles, isHeic } from './lib/convertHeic'
 import { stitchMedia, isWebCodecsSupported } from './lib/pipeline'
 import { saveBlob } from './lib/download'
-import { checkWebCodecsCapability, summarize } from './lib/webcodecsCapability'
 import { DEFAULT_STITCH_OPTIONS, type AppPhase, type StitchOptions } from './lib/types'
 
 function App() {
   const [phase, setPhase] = useState<AppPhase>({ name: 'idle' })
   const [options, setOptions] = useState<StitchOptions>(DEFAULT_STITCH_OPTIONS)
   const [mobileOptionsOpen, setMobileOptionsOpen] = useState(false)
+  const [diagnostics, setDiagnostics] = useState<SortDiagnosticRow[] | null>(null)
+  const [showDiagnostics, setShowDiagnostics] = useState(false)
   // Stitching is async; capture the latest options at the moment upload starts
   // so changes mid-flight don't retarget the in-progress encode.
   const optionsRef = useRef(options)
@@ -28,16 +32,9 @@ function App() {
     }
   }, [phase])
 
-  // One-shot WebCodecs capability probe on mount; logs to console.
-  useEffect(() => {
-    checkWebCodecsCapability().then((cap) => {
-      console.log('[webcodecs] capability:\n' + summarize(cap))
-      console.log('[webcodecs] raw:', cap)
-    })
-  }, [])
-
   const handleFiles = useCallback(async (files: File[]) => {
     try {
+      setDiagnostics(null)
       const heicCount = files.filter(isHeic).length
       if (heicCount > 0) {
         setPhase({ name: 'converting', total: heicCount, current: 0 })
@@ -46,7 +43,8 @@ function App() {
         setPhase({ name: 'converting', total, current })
       })
       setPhase({ name: 'sorting', total: prepared.length })
-      const items = await buildMediaItems(prepared)
+      const { items, diagnostics: diag } = await buildMediaItems(prepared)
+      setDiagnostics(diag)
       if (items.length === 0) {
         setPhase({
           name: 'error',
@@ -56,7 +54,7 @@ function App() {
       }
       setPhase({
         name: 'stitching',
-        total: items.length + 1,
+        total: items.length,
         current: 0,
         ratio: 0,
       })
@@ -83,6 +81,70 @@ function App() {
     }
   }, [])
 
+  const handlePickerItems = useCallback(async (picked: PickedMedia[]) => {
+    try {
+      setDiagnostics(null)
+      // HEIC handling — Google Photos almost always returns JPEG, but cover it
+      // just in case a user has a "Save Originals" iCloud-pass-through workflow.
+      const files = picked.map((p) => p.file)
+      const heicCount = files.filter(isHeic).length
+      if (heicCount > 0) {
+        setPhase({ name: 'converting', total: heicCount, current: 0 })
+      }
+      const prepared = await convertHeicFiles(files, ({ current, total }) => {
+        setPhase({ name: 'converting', total, current })
+      })
+      setPhase({ name: 'sorting', total: prepared.length })
+
+      // Picker-sourced items already have authoritative timestamps from Google's
+      // database. Build MediaItem[] directly and skip metadata extraction.
+      const items = prepared
+        .map((file, i) => ({
+          file,
+          kind: picked[i].kind,
+          timestamp: picked[i].timestamp,
+        }))
+        .sort((a, b) => a.timestamp - b.timestamp)
+
+      const diag: SortDiagnosticRow[] = items.map((it, i) => ({
+        order: i,
+        kind: it.kind,
+        name: it.file.name,
+        source: 'google-photos',
+        iso: new Date(it.timestamp).toISOString(),
+      }))
+      setDiagnostics(diag)
+
+      if (items.length === 0) {
+        setPhase({
+          name: 'error',
+          message: 'No supported images or videos found in your selection.',
+        })
+        return
+      }
+      setPhase({
+        name: 'stitching',
+        total: items.length,
+        current: 0,
+        ratio: 0,
+      })
+      const blob = await stitchMedia(items, optionsRef.current, ({ current, total, ratio }) => {
+        setPhase({ name: 'stitching', total, current, ratio })
+      })
+      const url = URL.createObjectURL(blob)
+      setPhase({ name: 'done', blob, url })
+    } catch (err) {
+      console.error(err)
+      const message = err instanceof Error ? err.message : 'Something went wrong.'
+      const details = err instanceof Error ? (err.stack ?? `${err.name}: ${err.message}`) : String(err)
+      setPhase({ name: 'error', message, details })
+    }
+  }, [])
+
+  const handlePickerError = useCallback((message: string) => {
+    setPhase({ name: 'error', message })
+  }, [])
+
   const reset = useCallback(() => setPhase({ name: 'idle' }), [])
 
   return (
@@ -93,6 +155,7 @@ function App() {
         {phase.name === 'idle' && webCodecsSupported && (
           <>
             <UploadZone onFiles={handleFiles} />
+            <GooglePhotosButton onItems={handlePickerItems} onError={handlePickerError} />
             <div className="hidden sm:block mt-4">
               <Options value={options} onChange={setOptions} />
             </div>
@@ -206,9 +269,20 @@ function App() {
             </button>
           </div>
         )}
+
+        {showDiagnostics && diagnostics && diagnostics.length > 0 && (
+          <DiagnosticsPanel rows={diagnostics} />
+        )}
       </main>
       <footer className="pb-6 text-center text-xs text-neutral-400">
-        v1.1.1
+        <button
+          type="button"
+          onClick={() => setShowDiagnostics((v) => !v)}
+          className="cursor-pointer hover:text-neutral-600 transition-colors"
+          aria-label="Toggle sort diagnostics"
+        >
+          v1.2.0
+        </button>
       </footer>
     </div>
   )

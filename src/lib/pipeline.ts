@@ -61,21 +61,8 @@ export async function stitchMedia(
     console.error('[webcodecs]', e)
   }
 
-  let videoEncodedChunks = 0
-  let videoMetaWithDecoderConfig = 0
   const videoEncoder = new VideoEncoder({
     output: (chunk, meta) => {
-      videoEncodedChunks++
-      if (meta?.decoderConfig) videoMetaWithDecoderConfig++
-      if (videoEncodedChunks === 1) {
-        console.log('[webcodecs] first encoded video chunk', {
-          type: chunk.type,
-          byteLength: chunk.byteLength,
-          hasDecoderConfig: !!meta?.decoderConfig,
-          codec: meta?.decoderConfig?.codec,
-          colorSpace: meta?.decoderConfig?.colorSpace,
-        })
-      }
       muxer.addVideoChunk(chunk, meta)
     },
     error: propagate,
@@ -94,10 +81,8 @@ export async function stitchMedia(
     avc: { format: 'avc' },
   })
 
-  let audioEncodedChunks = 0
   const audioEncoder = new AudioEncoder({
     output: (chunk, meta) => {
-      audioEncodedChunks++
       muxer.addAudioChunk(chunk, meta)
     },
     error: propagate,
@@ -190,11 +175,6 @@ export async function stitchMedia(
     await videoEncoder.flush()
     await audioEncoder.flush()
     if (errBox.err) throw errBox.err
-    console.log('[webcodecs] totals', {
-      videoEncodedChunks,
-      videoMetaWithDecoderConfig,
-      audioEncodedChunks,
-    })
   } finally {
     try { videoEncoder.close() } catch { /* ignore */ }
     try { audioEncoder.close() } catch { /* ignore */ }
@@ -397,20 +377,6 @@ async function processVideoFrames(
         const mp4Codec = fixCodecStringCase(rawMp4Codec)
         const normalizedCodec = normalizeCodecString(rawMp4Codec)
 
-        console.log(
-          '[webcodecs] mp4 codec=',
-          rawMp4Codec,
-          '→ case-fixed:',
-          mp4Codec,
-          '→ normalized (Main tier):',
-          normalizedCodec,
-        )
-        if (description) {
-          console.log('[webcodecs] description (first 32 bytes):', hexBytes(description, 32))
-          console.log('[webcodecs] description.length=', description.byteLength)
-        }
-        console.log('[webcodecs] codedW/H rotation:', codedWidth, codedHeight, rotation)
-
         // Synchronously enable sample extraction so mp4box emits samples
         // during this same appendBuffer call. We'll buffer them in onSamples
         // until the decoder is configured.
@@ -433,11 +399,6 @@ async function processVideoFrames(
                   `Browser cannot decode this stream.`,
               )
             }
-            console.log('[webcodecs] using decoder config', {
-              codec: chosen.codec,
-              hardwareAcceleration: chosen.hardwareAcceleration,
-              withDescription: !!chosen.description,
-            })
 
             decoderRef.current = new VideoDecoder({
               output: (frame) => {
@@ -520,22 +481,11 @@ async function processVideoFrames(
       }
     }
 
-    let firstChunkLogged = false
     mp4.onSamples = (id, _user, samples: Sample[]) => {
       try {
         if (id !== videoTrackId) return
         for (const s of samples) {
           if (!s.data) continue
-          if (!firstChunkLogged) {
-            firstChunkLogged = true
-            console.log('[webcodecs] first chunk', {
-              isKey: s.is_sync,
-              size: s.data.byteLength,
-              cts: s.cts,
-              timescale: s.timescale,
-              first16: hexBytes(s.data, 16),
-            })
-          }
           if (configured && decoderRef.current) {
             decodeSample(s)
           } else {
@@ -601,14 +551,6 @@ async function processVideoFrames(
           lastEmittedSlot = targetFrames - 1
         }
 
-        console.log('[webcodecs] processVideoFrames done', {
-          chunksDecoded,
-          framesDecoded,
-          framesEmitted,
-          targetFrames,
-          configured,
-          hasVideoTrack,
-        })
         resolve()
       } catch (e) {
         console.error('[webcodecs] decode pipeline failed', e)
@@ -634,8 +576,8 @@ async function processVideoAudio(
       TARGET_SAMPLE_RATE,
       TARGET_AUDIO_CHANNELS,
     )
-  } catch (e) {
-    console.warn('[webcodecs] audio decode failed, substituting silence', e)
+  } catch {
+    // Decode failed — emitSilence path below covers it.
   }
 
   if (!decoded) {
@@ -941,12 +883,10 @@ async function findWorkingDecoderConfig(
       try {
         const r = await VideoDecoder.isConfigSupported(cfg)
         if (r.supported && r.config) {
-          console.log('[webcodecs] config accepted:', cand.label, accel)
           return r.config
         }
-        console.log('[webcodecs] not supported:', cand.label, accel)
-      } catch (e) {
-        console.warn('[webcodecs] isConfigSupported threw:', cand.label, accel, e)
+      } catch {
+        // Try the next candidate.
       }
     }
   }
@@ -959,11 +899,6 @@ function forceMainTierDescription(desc: Uint8Array): Uint8Array {
   // hvcC byte 1: bits = profile_space(2) | tier_flag(1) | profile_idc(5)
   copy[1] = copy[1] & 0xdf
   return copy
-}
-
-function hexBytes(buf: ArrayBufferView, max: number): string {
-  const view = new Uint8Array(buf.buffer, buf.byteOffset, Math.min(buf.byteLength, max))
-  return Array.from(view, (b) => b.toString(16).padStart(2, '0')).join(' ')
 }
 
 // mp4box emits strings like 'hvc1.1.6.H120.b0' with lowercase constraint flag

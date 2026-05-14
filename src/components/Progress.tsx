@@ -6,7 +6,7 @@ interface Props {
 }
 
 export function Progress({ label, current, total, ratio }: Props) {
-  const overall = total === 0 ? 0 : Math.min(1, ((current - 1) + ratio) / total)
+  const overall = total === 0 ? 0 : Math.max(0, Math.min(1, ((current - 1) + ratio) / total))
   const pct = Math.round(overall * 100)
 
   return (
