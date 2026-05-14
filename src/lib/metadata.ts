@@ -1,5 +1,6 @@
 import exifr from 'exifr'
 import type { MediaItem, MediaKind } from './types'
+import type { PickerMetadata } from './googlePhotosPicker'
 
 function classify(file: File): MediaKind | null {
   if (file.type.startsWith('image/')) return 'image'
@@ -329,6 +330,64 @@ export function safeName(name: string): string {
   return name.replace(/[^a-zA-Z0-9._-]/g, '_')
 }
 
+// Matches locally-uploaded files to Picker-API metadata so we can apply
+// Google's authoritative capture timestamps without downloading the bytes.
+// Returns Map<File, timestampMs>. Each picker entry is used at most once.
+//
+// Pass 1: exact filename match (case-insensitive).
+// Pass 2: filename without extension + same kind. Catches HEIC→JPG conversions
+//         and similar where the local file picker normalized the extension.
+//
+// Files that don't match are simply absent from the map; callers should fall
+// back to whatever timestamp source they were using before.
+export function matchFilesToPickerMetadata(
+  files: File[],
+  metadata: PickerMetadata[],
+): Map<File, number> {
+  const result = new Map<File, number>()
+  const used = new Set<number>()
+
+  const kindOf = (file: File): MediaKind | null => {
+    if (file.type.startsWith('image/')) return 'image'
+    if (file.type.startsWith('video/')) return 'video'
+    return null
+  }
+
+  // Pass 1: exact case-insensitive filename match.
+  for (const file of files) {
+    if (result.has(file)) continue
+    const target = file.name.toLowerCase()
+    for (let i = 0; i < metadata.length; i++) {
+      if (used.has(i)) continue
+      if (metadata[i].filename.toLowerCase() === target) {
+        result.set(file, metadata[i].timestamp)
+        used.add(i)
+        break
+      }
+    }
+  }
+
+  // Pass 2: filename-without-extension + same kind.
+  for (const file of files) {
+    if (result.has(file)) continue
+    const kind = kindOf(file)
+    if (!kind) continue
+    const baseLocal = file.name.toLowerCase().replace(/\.[^.]+$/, '')
+    for (let i = 0; i < metadata.length; i++) {
+      if (used.has(i)) continue
+      if (metadata[i].kind !== kind) continue
+      const baseMeta = metadata[i].filename.toLowerCase().replace(/\.[^.]+$/, '')
+      if (baseMeta === baseLocal) {
+        result.set(file, metadata[i].timestamp)
+        used.add(i)
+        break
+      }
+    }
+  }
+
+  return result
+}
+
 // Extracts a capture timestamp from common phone-naming patterns:
 //   VID20260509100810.mp4       (Android, no separators)
 //   VID_20240315_141233.mp4     (Samsung etc.)
@@ -386,32 +445,44 @@ export interface BuildMediaItemsResult {
   diagnostics: SortDiagnosticRow[]
 }
 
-export async function buildMediaItems(files: File[]): Promise<BuildMediaItemsResult> {
+export async function buildMediaItems(
+  files: File[],
+  // Authoritative timestamps from Google Photos Picker, keyed by File. Files
+  // present in this map skip the metadata cascade entirely and are marked
+  // source='google-photos'. Allows the "Fix dates from Google Photos" flow.
+  knownTimestamps?: Map<File, number>,
+): Promise<BuildMediaItemsResult> {
   type Annotated = { item: MediaItem; source: TimestampSource; seq: number | null }
   const annotated: Annotated[] = []
   for (const file of files) {
     const kind = classify(file)
     if (!kind) continue
-    // Filename-encoded dates beat metadata: Google Photos / cloud syncs often
-    // rewrite mvhd to processing time, so the original capture date survives
-    // only in the filename (e.g. VID20260509100810.mp4).
-    const fromFilename = parseFilenameDate(file.name)
     let source: TimestampSource
     let timestamp: number
-    if (fromFilename != null) {
-      timestamp = fromFilename
-      source = 'filename'
+    const known = knownTimestamps?.get(file)
+    if (known != null) {
+      timestamp = known
+      source = 'google-photos'
     } else {
-      const fromMeta =
-        kind === 'image'
-          ? await readImageTimestamp(file)
-          : await readVideoTimestamp(file)
-      if (fromMeta != null) {
-        timestamp = fromMeta
-        source = 'meta'
+      // Filename-encoded dates beat metadata: Google Photos / cloud syncs often
+      // rewrite mvhd to processing time, so the original capture date survives
+      // only in the filename (e.g. VID20260509100810.mp4).
+      const fromFilename = parseFilenameDate(file.name)
+      if (fromFilename != null) {
+        timestamp = fromFilename
+        source = 'filename'
       } else {
-        timestamp = file.lastModified
-        source = 'lastModified'
+        const fromMeta =
+          kind === 'image'
+            ? await readImageTimestamp(file)
+            : await readVideoTimestamp(file)
+        if (fromMeta != null) {
+          timestamp = fromMeta
+          source = 'meta'
+        } else {
+          timestamp = file.lastModified
+          source = 'lastModified'
+        }
       }
     }
     annotated.push({

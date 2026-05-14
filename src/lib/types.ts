@@ -25,6 +25,8 @@ export type AppPhase =
   | { name: 'idle' }
   | { name: 'converting'; total: number; current: number }
   | { name: 'sorting'; total: number }
+  | { name: 'review'; items: MediaItem[]; unreliableCount: number }
+  | { name: 'matching'; pickerPhase: string; pickerUri?: string }
   | { name: 'stitching'; total: number; current: number; ratio: number }
   | { name: 'done'; blob: Blob; url: string }
   | { name: 'error'; message: string; details?: string }

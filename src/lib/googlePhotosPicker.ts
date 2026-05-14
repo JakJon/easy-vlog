@@ -1,29 +1,32 @@
 import { getAccessToken } from './googleAuth'
 
-// Google Photos Picker API client. Flow:
-//   1. Create a session.
-//   2. Open the returned pickerUri in a popup so the user can pick items in
-//      Google's hosted UI.
-//   3. Poll the session endpoint until mediaItemsSet === true.
-//   4. List the picked media items.
-//   5. Download each item's bytes via baseUrl + "=d" with the same OAuth token.
+// Google Photos Picker API — metadata-only flow. We use the picker SOLELY to
+// retrieve the user's authoritative capture timestamps from Google's database;
+// the actual file bytes come from the user's local upload (much faster than
+// re-downloading from the Photos CDN, and the CORS-blocked video endpoint is
+// avoided entirely).
 //
-// The mediaItem response includes mediaFile.mediaFileMetadata.creationTime,
-// which is the original capture time straight from Google's database — the
-// whole reason we built this integration.
+// Flow:
+//   1. Create a session.
+//   2. Open the returned pickerUri so the user can pick items in Google's UI.
+//      The caller pre-opens a blank window on the click to dodge popup blockers.
+//   3. Poll until mediaItemsSet.
+//   4. List the picked media items.
+//   5. Return their { filename, mimeType, kind, timestamp } — no downloads.
+//
+// Matching local files to this metadata happens in src/lib/metadata.ts.
 
 const API_BASE = 'https://photospicker.googleapis.com/v1'
 
-export interface PickedMedia {
-  file: File
+export interface PickerMetadata {
+  filename: string
+  mimeType: string
   kind: 'image' | 'video'
   timestamp: number // ms since epoch
 }
 
 export interface PickerProgress {
-  phase: 'auth' | 'session' | 'waiting' | 'downloading'
-  current?: number
-  total?: number
+  phase: 'auth' | 'session' | 'waiting' | 'listing'
   pickerUri?: string
 }
 
@@ -106,42 +109,15 @@ function filenameFor(item: PickedMediaItem): string {
   return `${item.id}.${ext}`
 }
 
-// Videos go through our Netlify Edge Function because Google's Picker API
-// 302-redirects them to video-downloads.googleusercontent.com, which doesn't
-// send Access-Control-Allow-Origin and so blocks browser fetches. Photos are
-// served directly with proper CORS so we hit lh3.googleusercontent.com.
-const PROXY_PATH = '/api/photos-proxy'
-
-async function downloadMediaItem(item: PickedMediaItem, token: string): Promise<File> {
-  if (!item.mediaFile?.baseUrl) throw new Error('mediaItem missing baseUrl')
-  // Per Picker API docs: photos use "=d" for original quality, videos use "=dv".
-  const isVideo =
-    item.type === 'VIDEO' || (item.mediaFile.mimeType?.startsWith('video/') ?? false)
-  const suffix = isVideo ? '=dv' : '=d'
-  const directUrl = `${item.mediaFile.baseUrl}${suffix}`
-  const fetchUrl = isVideo
-    ? `${PROXY_PATH}?url=${encodeURIComponent(directUrl)}`
-    : directUrl
-  const res = await fetch(fetchUrl, {
-    headers: { Authorization: `Bearer ${token}` },
-  })
-  if (!res.ok) {
-    throw new Error(`Failed to download ${item.id}: ${res.status} ${res.statusText}`)
-  }
-  const blob = await res.blob()
-  return new File([blob], filenameFor(item), {
-    type: item.mediaFile.mimeType ?? blob.type,
-    lastModified: Date.now(),
-  })
-}
-
-// Main entrypoint. Drives the whole flow. `onProgress` reports phase changes
-// so the UI can show "Open the picker in Google Photos", "Downloading 3/5", etc.
-// `signal` lets the caller cancel (e.g. user closes a dialog).
-export async function pickFromGooglePhotos(
+// Main entrypoint. Drives the picker flow and returns just the metadata —
+// crucially, no MediaItem byte downloads happen here. `pickerWindow` is a
+// window the caller already opened synchronously inside the user's click
+// handler so the browser doesn't block the navigation as an unsolicited popup.
+export async function pickMetadataFromGooglePhotos(
   onProgress: (p: PickerProgress) => void,
   signal?: AbortSignal,
-): Promise<PickedMedia[]> {
+  pickerWindow?: Window | null,
+): Promise<PickerMetadata[]> {
   onProgress({ phase: 'auth' })
   const token = await getAccessToken()
 
@@ -152,16 +128,23 @@ export async function pickFromGooglePhotos(
     token,
   })
 
-  // Open Google's hosted picker. New tab is more reliable than a popup on
-  // mobile (popup blockers, iOS Safari, etc.).
-  const opened = window.open(session.pickerUri, '_blank', 'noopener,noreferrer')
+  let opened: Window | null = null
+  if (pickerWindow && !pickerWindow.closed) {
+    try {
+      pickerWindow.location.href = session.pickerUri
+      opened = pickerWindow
+    } catch {
+      opened = null
+    }
+  }
+  if (!opened) {
+    opened = window.open(session.pickerUri, '_blank', 'noopener,noreferrer')
+  }
   onProgress({ phase: 'waiting', pickerUri: session.pickerUri })
 
-  // Poll the session. Google recommends sticking to the server-provided
-  // interval to avoid rate limits.
   const pollSeconds = parsePollIntervalSeconds(session.pollingConfig?.pollInterval)
   const startedAt = Date.now()
-  const POLL_TIMEOUT_MS = 15 * 60 * 1000 // give the user 15 minutes to pick
+  const POLL_TIMEOUT_MS = 15 * 60 * 1000
 
   let finalSession: PickerSession = session
   while (true) {
@@ -177,14 +160,13 @@ export async function pickFromGooglePhotos(
     }
   }
 
-  // Try to close the picker window if it's still ours to close.
   try {
     opened?.close()
   } catch {
     // ignore
   }
 
-  // List items (paginated). Usually fits in one page for typical selections.
+  onProgress({ phase: 'listing' })
   const items: PickedMediaItem[] = []
   let pageToken: string | undefined
   do {
@@ -199,36 +181,20 @@ export async function pickFromGooglePhotos(
     throw new Error('No items were selected in the picker.')
   }
 
-  // Download in parallel but with a concurrency cap to avoid hammering the API.
-  const CONCURRENCY = 4
-  const results: PickedMedia[] = new Array(items.length)
-  let downloaded = 0
-  onProgress({ phase: 'downloading', current: 0, total: items.length })
-
-  let nextIndex = 0
-  async function worker() {
-    while (true) {
-      if (signal?.aborted) throw new Error('Picker cancelled')
-      const i = nextIndex++
-      if (i >= items.length) return
-      const item = items[i]
-      const kind = classifyType(item.mediaFile?.mimeType ?? '', item.type)
-      if (!kind) continue
-      const file = await downloadMediaItem(item, token)
-      const creation = item.mediaFile?.mediaFileMetadata?.creationTime ?? item.createTime
-      const ts = creation ? Date.parse(creation) : Date.now()
-      results[i] = {
-        file,
-        kind,
-        timestamp: Number.isFinite(ts) ? ts : Date.now(),
-      }
-      downloaded++
-      onProgress({ phase: 'downloading', current: downloaded, total: items.length })
-    }
+  const out: PickerMetadata[] = []
+  for (const item of items) {
+    const mime = item.mediaFile?.mimeType ?? ''
+    const kind = classifyType(mime, item.type)
+    if (!kind) continue
+    const creation = item.mediaFile?.mediaFileMetadata?.creationTime ?? item.createTime
+    const ts = creation ? Date.parse(creation) : NaN
+    if (!Number.isFinite(ts)) continue
+    out.push({
+      filename: filenameFor(item),
+      mimeType: mime,
+      kind,
+      timestamp: ts,
+    })
   }
-
-  const workers = Array.from({ length: Math.min(CONCURRENCY, items.length) }, worker)
-  await Promise.all(workers)
-  // Filter out any entries left undefined (unrecognized type).
-  return results.filter(Boolean)
+  return out
 }

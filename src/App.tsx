@@ -3,15 +3,24 @@ import { Header } from './components/Header'
 import { UploadZone } from './components/UploadZone'
 import { Options } from './components/Options'
 import { DiagnosticsPanel } from './components/DiagnosticsPanel'
-import { GooglePhotosButton } from './components/GooglePhotosButton'
-import type { PickedMedia } from './lib/googlePhotosPicker'
+import { ReviewScreen } from './components/ReviewScreen'
 import { Progress } from './components/Progress'
 import { DoneScreen } from './components/DoneScreen'
-import { buildMediaItems, type SortDiagnosticRow } from './lib/metadata'
+import {
+  buildMediaItems,
+  matchFilesToPickerMetadata,
+  type SortDiagnosticRow,
+} from './lib/metadata'
+import type { PickerMetadata } from './lib/googlePhotosPicker'
 import { convertHeicFiles, isHeic } from './lib/convertHeic'
 import { stitchMedia, isWebCodecsSupported } from './lib/pipeline'
 import { saveBlob } from './lib/download'
-import { DEFAULT_STITCH_OPTIONS, type AppPhase, type StitchOptions } from './lib/types'
+import {
+  DEFAULT_STITCH_OPTIONS,
+  type AppPhase,
+  type MediaItem,
+  type StitchOptions,
+} from './lib/types'
 
 function App() {
   const [phase, setPhase] = useState<AppPhase>({ name: 'idle' })
@@ -32,120 +41,106 @@ function App() {
     }
   }, [phase])
 
-  const handleFiles = useCallback(async (files: File[]) => {
-    try {
-      setDiagnostics(null)
-      const heicCount = files.filter(isHeic).length
-      if (heicCount > 0) {
-        setPhase({ name: 'converting', total: heicCount, current: 0 })
+  const runStitch = useCallback(async (items: MediaItem[]) => {
+    setPhase({
+      name: 'stitching',
+      total: items.length,
+      current: 0,
+      ratio: 0,
+    })
+    const blob = await stitchMedia(items, optionsRef.current, ({ current, total, ratio }) => {
+      setPhase({ name: 'stitching', total, current, ratio })
+    })
+    const url = URL.createObjectURL(blob)
+    setPhase({ name: 'done', blob, url })
+  }, [])
+
+  const reportError = useCallback((err: unknown) => {
+    console.error(err)
+    const message = err instanceof Error ? err.message : 'Something went wrong.'
+    let details: string
+    if (err instanceof Error) {
+      details = err.stack ?? `${err.name}: ${err.message}`
+    } else {
+      try {
+        details = JSON.stringify(err, null, 2)
+      } catch {
+        details = String(err)
       }
-      const prepared = await convertHeicFiles(files, ({ current, total }) => {
-        setPhase({ name: 'converting', total, current })
-      })
-      setPhase({ name: 'sorting', total: prepared.length })
-      const { items, diagnostics: diag } = await buildMediaItems(prepared)
-      setDiagnostics(diag)
-      if (items.length === 0) {
-        setPhase({
-          name: 'error',
-          message: 'No supported images or videos found in your selection.',
-        })
-        return
-      }
-      setPhase({
-        name: 'stitching',
-        total: items.length,
-        current: 0,
-        ratio: 0,
-      })
-      const blob = await stitchMedia(items, optionsRef.current, ({ current, total, ratio }) => {
-        setPhase({ name: 'stitching', total, current, ratio })
-      })
-      const url = URL.createObjectURL(blob)
-      setPhase({ name: 'done', blob, url })
-    } catch (err) {
-      console.error(err)
-      const message =
-        err instanceof Error ? err.message : 'Something went wrong.'
-      let details: string
-      if (err instanceof Error) {
-        details = err.stack ?? `${err.name}: ${err.message}`
-      } else {
-        try {
-          details = JSON.stringify(err, null, 2)
-        } catch {
-          details = String(err)
+    }
+    setPhase({ name: 'error', message, details })
+  }, [])
+
+  const handleFiles = useCallback(
+    async (files: File[]) => {
+      try {
+        setDiagnostics(null)
+        const heicCount = files.filter(isHeic).length
+        if (heicCount > 0) {
+          setPhase({ name: 'converting', total: heicCount, current: 0 })
         }
-      }
-      setPhase({ name: 'error', message, details })
-    }
-  }, [])
-
-  const handlePickerItems = useCallback(async (picked: PickedMedia[]) => {
-    try {
-      setDiagnostics(null)
-      // HEIC handling — Google Photos almost always returns JPEG, but cover it
-      // just in case a user has a "Save Originals" iCloud-pass-through workflow.
-      const files = picked.map((p) => p.file)
-      const heicCount = files.filter(isHeic).length
-      if (heicCount > 0) {
-        setPhase({ name: 'converting', total: heicCount, current: 0 })
-      }
-      const prepared = await convertHeicFiles(files, ({ current, total }) => {
-        setPhase({ name: 'converting', total, current })
-      })
-      setPhase({ name: 'sorting', total: prepared.length })
-
-      // Picker-sourced items already have authoritative timestamps from Google's
-      // database. Build MediaItem[] directly and skip metadata extraction.
-      const items = prepared
-        .map((file, i) => ({
-          file,
-          kind: picked[i].kind,
-          timestamp: picked[i].timestamp,
-        }))
-        .sort((a, b) => a.timestamp - b.timestamp)
-
-      const diag: SortDiagnosticRow[] = items.map((it, i) => ({
-        order: i,
-        kind: it.kind,
-        name: it.file.name,
-        source: 'google-photos',
-        iso: new Date(it.timestamp).toISOString(),
-      }))
-      setDiagnostics(diag)
-
-      if (items.length === 0) {
-        setPhase({
-          name: 'error',
-          message: 'No supported images or videos found in your selection.',
+        const prepared = await convertHeicFiles(files, ({ current, total }) => {
+          setPhase({ name: 'converting', total, current })
         })
-        return
+        setPhase({ name: 'sorting', total: prepared.length })
+        const { items, diagnostics: diag } = await buildMediaItems(prepared)
+        setDiagnostics(diag)
+        if (items.length === 0) {
+          setPhase({
+            name: 'error',
+            message: 'No supported images or videos found in your selection.',
+          })
+          return
+        }
+        const unreliableCount = diag.filter((d) => d.source === 'lastModified').length
+        if (unreliableCount > 0) {
+          setPhase({ name: 'review', items, unreliableCount })
+          return
+        }
+        await runStitch(items)
+      } catch (err) {
+        reportError(err)
       }
-      setPhase({
-        name: 'stitching',
-        total: items.length,
-        current: 0,
-        ratio: 0,
-      })
-      const blob = await stitchMedia(items, optionsRef.current, ({ current, total, ratio }) => {
-        setPhase({ name: 'stitching', total, current, ratio })
-      })
-      const url = URL.createObjectURL(blob)
-      setPhase({ name: 'done', blob, url })
+    },
+    [runStitch, reportError],
+  )
+
+  const handleMatched = useCallback(
+    async (metadata: PickerMetadata[]) => {
+      // Pull the files that are currently in review and re-run buildMediaItems
+      // with the picker timestamps applied as overrides.
+      if (phase.name !== 'review') return
+      try {
+        const files = phase.items.map((it) => it.file)
+        const known = matchFilesToPickerMetadata(files, metadata)
+        const { items, diagnostics: diag } = await buildMediaItems(files, known)
+        setDiagnostics(diag)
+        const stillUnreliable = diag.filter((d) => d.source === 'lastModified').length
+        if (stillUnreliable > 0) {
+          setPhase({ name: 'review', items, unreliableCount: stillUnreliable })
+          return
+        }
+        await runStitch(items)
+      } catch (err) {
+        reportError(err)
+      }
+    },
+    [phase, runStitch, reportError],
+  )
+
+  const handleStitchAnyway = useCallback(async () => {
+    if (phase.name !== 'review') return
+    try {
+      await runStitch(phase.items)
     } catch (err) {
-      console.error(err)
-      const message = err instanceof Error ? err.message : 'Something went wrong.'
-      const details = err instanceof Error ? (err.stack ?? `${err.name}: ${err.message}`) : String(err)
-      setPhase({ name: 'error', message, details })
+      reportError(err)
     }
-  }, [])
+  }, [phase, runStitch, reportError])
 
-  const handlePickerError = useCallback((message: string) => {
-    setPhase({ name: 'error', message })
+  const reset = useCallback(() => {
+    setPhase({ name: 'idle' })
+    setDiagnostics(null)
   }, [])
-
-  const reset = useCallback(() => setPhase({ name: 'idle' }), [])
 
   return (
     <div className="min-h-full w-full bg-neutral-50">
@@ -155,7 +150,6 @@ function App() {
         {phase.name === 'idle' && webCodecsSupported && (
           <>
             <UploadZone onFiles={handleFiles} />
-            <GooglePhotosButton onItems={handlePickerItems} onError={handlePickerError} />
             <div className="hidden sm:block mt-4">
               <Options value={options} onChange={setOptions} />
             </div>
@@ -228,6 +222,17 @@ function App() {
           />
         )}
 
+        {phase.name === 'review' && diagnostics && (
+          <ReviewScreen
+            totalCount={phase.items.length}
+            unreliableCount={phase.unreliableCount}
+            diagnostics={diagnostics}
+            onMatched={handleMatched}
+            onStitchAnyway={handleStitchAnyway}
+            onError={(message) => setPhase({ name: 'error', message })}
+          />
+        )}
+
         {phase.name === 'stitching' && (
           <Progress
             label={
@@ -270,7 +275,7 @@ function App() {
           </div>
         )}
 
-        {showDiagnostics && diagnostics && diagnostics.length > 0 && (
+        {phase.name !== 'review' && showDiagnostics && diagnostics && diagnostics.length > 0 && (
           <DiagnosticsPanel rows={diagnostics} />
         )}
       </main>
@@ -281,7 +286,7 @@ function App() {
           className="cursor-pointer hover:text-neutral-600 transition-colors"
           aria-label="Toggle sort diagnostics"
         >
-          v1.2.0
+          v1.3.0
         </button>
       </footer>
     </div>
