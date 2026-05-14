@@ -3,6 +3,7 @@ import { Header } from './components/Header'
 import { UploadZone } from './components/UploadZone'
 import { Options } from './components/Options'
 import { DiagnosticsPanel } from './components/DiagnosticsPanel'
+import { PickerMetadataPanel } from './components/PickerMetadataPanel'
 import { ReviewScreen } from './components/ReviewScreen'
 import { Progress } from './components/Progress'
 import { DoneScreen } from './components/DoneScreen'
@@ -28,6 +29,10 @@ function App() {
   const [mobileOptionsOpen, setMobileOptionsOpen] = useState(false)
   const [diagnostics, setDiagnostics] = useState<SortDiagnosticRow[] | null>(null)
   const [showDiagnostics, setShowDiagnostics] = useState(false)
+  const [lastMatchAttempt, setLastMatchAttempt] = useState<{
+    pickerMetadata: PickerMetadata[]
+    matchedCount: number
+  } | null>(null)
   // Stitching is async; capture the latest options at the moment upload starts
   // so changes mid-flight don't retarget the in-progress encode.
   const optionsRef = useRef(options)
@@ -75,6 +80,7 @@ function App() {
     async (files: File[]) => {
       try {
         setDiagnostics(null)
+        setLastMatchAttempt(null)
         const heicCount = files.filter(isHeic).length
         if (heicCount > 0) {
           setPhase({ name: 'converting', total: heicCount, current: 0 })
@@ -113,6 +119,10 @@ function App() {
       try {
         const files = phase.items.map((it) => it.file)
         const known = matchFilesToPickerMetadata(files, metadata)
+        setLastMatchAttempt({
+          pickerMetadata: metadata,
+          matchedCount: known.size,
+        })
         const { items, diagnostics: diag } = await buildMediaItems(files, known)
         setDiagnostics(diag)
         const stillUnreliable = diag.filter((d) => d.source === 'lastModified').length
@@ -140,6 +150,7 @@ function App() {
   const reset = useCallback(() => {
     setPhase({ name: 'idle' })
     setDiagnostics(null)
+    setLastMatchAttempt(null)
   }, [])
 
   return (
@@ -227,6 +238,7 @@ function App() {
             totalCount={phase.items.length}
             unreliableCount={phase.unreliableCount}
             diagnostics={diagnostics}
+            lastMatchAttempt={lastMatchAttempt}
             onMatched={handleMatched}
             onStitchAnyway={handleStitchAnyway}
             onError={(message) => setPhase({ name: 'error', message })}
@@ -275,8 +287,18 @@ function App() {
           </div>
         )}
 
-        {phase.name !== 'review' && showDiagnostics && diagnostics && diagnostics.length > 0 && (
-          <DiagnosticsPanel rows={diagnostics} />
+        {phase.name !== 'review' && showDiagnostics && (
+          <>
+            {diagnostics && diagnostics.length > 0 && (
+              <DiagnosticsPanel rows={diagnostics} />
+            )}
+            {lastMatchAttempt && lastMatchAttempt.pickerMetadata.length > 0 && (
+              <PickerMetadataPanel
+                items={lastMatchAttempt.pickerMetadata}
+                matchedCount={lastMatchAttempt.matchedCount}
+              />
+            )}
+          </>
         )}
       </main>
       <footer className="pb-6 text-center text-xs text-neutral-400">
@@ -286,7 +308,7 @@ function App() {
           className="cursor-pointer hover:text-neutral-600 transition-colors"
           aria-label="Toggle sort diagnostics"
         >
-          v1.3.0
+          v1.3.1
         </button>
       </footer>
     </div>
