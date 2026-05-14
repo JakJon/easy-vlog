@@ -117,13 +117,23 @@ function App() {
       // with the picker timestamps applied as overrides.
       if (phase.name !== 'review') return
       try {
-        const files = phase.items.map((it) => it.file)
-        const known = matchFilesToPickerMetadata(files, metadata)
+        // Only attempt matching on unreliable items. Reliable items already
+        // have a trustworthy timestamp source; including them in the match
+        // can mis-pair items when Pass 3 (sorted pairing) kicks in and naming
+        // families are mixed.
+        const allFiles = phase.items.map((it) => it.file)
+        const unreliableFiles: File[] = []
+        for (let i = 0; i < phase.items.length; i++) {
+          if (diagnostics?.[i]?.source === 'lastModified') {
+            unreliableFiles.push(phase.items[i].file)
+          }
+        }
+        const known = matchFilesToPickerMetadata(unreliableFiles, metadata)
         setLastMatchAttempt({
           pickerMetadata: metadata,
           matchedCount: known.size,
         })
-        const { items, diagnostics: diag } = await buildMediaItems(files, known)
+        const { items, diagnostics: diag } = await buildMediaItems(allFiles, known)
         setDiagnostics(diag)
         const stillUnreliable = diag.filter((d) => d.source === 'lastModified').length
         if (stillUnreliable > 0) {
@@ -135,7 +145,7 @@ function App() {
         reportError(err)
       }
     },
-    [phase, runStitch, reportError],
+    [phase, diagnostics, runStitch, reportError],
   )
 
   const handleStitchAnyway = useCallback(async () => {
@@ -308,7 +318,7 @@ function App() {
           className="cursor-pointer hover:text-neutral-600 transition-colors"
           aria-label="Toggle sort diagnostics"
         >
-          v1.3.1
+          v1.3.3
         </button>
       </footer>
     </div>

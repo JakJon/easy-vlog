@@ -337,6 +337,17 @@ export function safeName(name: string): string {
 // Pass 1: exact filename match (case-insensitive).
 // Pass 2: filename without extension + same kind. Catches HEIC→JPG conversions
 //         and similar where the local file picker normalized the extension.
+// Pass 3: paired-by-sort fallback, per-kind. When local filenames have been
+//         rewritten by Android's MediaStore (OnePlus, Samsung, etc. all do
+//         this — files arrive as 1000008XXX.mp4 even when Google Photos
+//         still has the original camera filename), Pass 1/2 produce zero
+//         matches. If the count of remaining-unmatched locals of a kind
+//         equals the count of remaining-unmatched picker items of the same
+//         kind, AND every unmatched local has a parseable trailing numeric
+//         counter, we sort local by counter and picker by timestamp and pair
+//         them index-by-index. Phone cameras increment counters in capture
+//         order, so this recovers the right ordering when filenames don't
+//         agree at all.
 //
 // Files that don't match are simply absent from the map; callers should fall
 // back to whatever timestamp source they were using before.
@@ -382,6 +393,40 @@ export function matchFilesToPickerMetadata(
         used.add(i)
         break
       }
+    }
+  }
+
+  // Pass 3: paired-by-sort fallback. See header comment for the heuristic.
+  const kinds: MediaKind[] = ['image', 'video']
+  for (const kind of kinds) {
+    const localCandidates: Array<{ file: File; seq: number }> = []
+    let canPair = true
+    for (const file of files) {
+      if (result.has(file)) continue
+      if (kindOf(file) !== kind) continue
+      const seq = extractFilenameSequence(file.name)
+      if (seq == null) {
+        // One unsorted local file would break the pairing. Skip this kind.
+        canPair = false
+        break
+      }
+      localCandidates.push({ file, seq })
+    }
+    if (!canPair || localCandidates.length === 0) continue
+
+    const pickerCandidates: Array<{ m: PickerMetadata; i: number }> = []
+    for (let i = 0; i < metadata.length; i++) {
+      if (used.has(i)) continue
+      if (metadata[i].kind !== kind) continue
+      pickerCandidates.push({ m: metadata[i], i })
+    }
+    if (localCandidates.length !== pickerCandidates.length) continue
+
+    localCandidates.sort((a, b) => a.seq - b.seq)
+    pickerCandidates.sort((a, b) => a.m.timestamp - b.m.timestamp)
+    for (let j = 0; j < localCandidates.length; j++) {
+      result.set(localCandidates[j].file, pickerCandidates[j].m.timestamp)
+      used.add(pickerCandidates[j].i)
     }
   }
 
