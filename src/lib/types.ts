@@ -26,6 +26,7 @@ export type AppPhase =
   | { name: 'converting'; total: number; current: number }
   | { name: 'sorting'; total: number }
   | { name: 'review'; items: MediaItem[]; unreliableCount: number }
+  | { name: 'reorder'; items: MediaItem[] }
   | { name: 'matching'; pickerPhase: string; pickerUri?: string }
   | { name: 'stitching'; total: number; current: number; ratio: number }
   | { name: 'done'; blob: Blob; url: string }

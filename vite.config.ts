@@ -12,9 +12,9 @@ const crossOriginIsolation = {
 
 export default defineConfig({
   plugins: [react()],
-  server: { headers: crossOriginIsolation },
-  preview: { headers: crossOriginIsolation },
-  optimizeDeps: {
-    exclude: ['@ffmpeg/ffmpeg', '@ffmpeg/util'],
-  },
+  // `host: true` binds Vite to 0.0.0.0 so phones on the same Wi-Fi can hit
+  // the dev server at http://<your-computer-ip>:5173 . If you don't want
+  // others on the LAN to reach it, comment this back out.
+  server: { host: true, headers: crossOriginIsolation },
+  preview: { host: true, headers: crossOriginIsolation },
 })

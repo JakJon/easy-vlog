@@ -5,6 +5,7 @@ import { Options } from './components/Options'
 import { DiagnosticsPanel } from './components/DiagnosticsPanel'
 import { PickerMetadataPanel } from './components/PickerMetadataPanel'
 import { ReviewScreen } from './components/ReviewScreen'
+import { ManualReorder } from './components/ManualReorder'
 import { Progress } from './components/Progress'
 import { DoneScreen } from './components/DoneScreen'
 import {
@@ -157,6 +158,49 @@ function App() {
     }
   }, [phase, runStitch, reportError])
 
+  const handleManualReorder = useCallback(() => {
+    if (phase.name !== 'review') return
+    setPhase({ name: 'reorder', items: phase.items })
+  }, [phase])
+
+  const handleManualOrderDone = useCallback(
+    async (reordered: MediaItem[]) => {
+      if (phase.name !== 'reorder') return
+      // Synthesize monotonically-increasing timestamps to match the user's
+      // chosen order — the stitch pipeline iterates items[] directly, so the
+      // exact timestamps only need to preserve order. Anchored at "now" so
+      // future re-sorts (if any) keep this set ahead of older anchors.
+      const base = Date.now()
+      const ordered = reordered.map((item, i) => ({ ...item, timestamp: base + i }))
+      const diag: SortDiagnosticRow[] = ordered.map((it, i) => ({
+        order: i,
+        kind: it.kind,
+        name: it.file.name,
+        source: 'google-photos',
+        iso: new Date(it.timestamp).toISOString(),
+      }))
+      setDiagnostics(diag)
+      try {
+        await runStitch(ordered)
+      } catch (err) {
+        reportError(err)
+      }
+    },
+    [phase, runStitch, reportError],
+  )
+
+  const handleManualReorderCancel = useCallback(() => {
+    if (phase.name !== 'reorder') return
+    // Calculate how many items were unreliable from the diagnostics that
+    // were in place when we entered reorder. If diagnostics is missing for
+    // any reason, fall back to assuming "all of them" so the review screen
+    // still renders.
+    const unreliable = diagnostics
+      ? diagnostics.filter((d) => d.source === 'lastModified').length
+      : phase.items.length
+    setPhase({ name: 'review', items: phase.items, unreliableCount: unreliable })
+  }, [phase, diagnostics])
+
   const reset = useCallback(() => {
     setPhase({ name: 'idle' })
     setDiagnostics(null)
@@ -236,7 +280,7 @@ function App() {
 
         {phase.name === 'sorting' && (
           <Progress
-            label="Reading metadata and sorting..."
+            label="Getting ready..."
             current={1}
             total={phase.total}
             ratio={0.5}
@@ -250,15 +294,24 @@ function App() {
             diagnostics={diagnostics}
             lastMatchAttempt={lastMatchAttempt}
             onMatched={handleMatched}
+            onManualReorder={handleManualReorder}
             onStitchAnyway={handleStitchAnyway}
             onError={(message) => setPhase({ name: 'error', message })}
+          />
+        )}
+
+        {phase.name === 'reorder' && (
+          <ManualReorder
+            items={phase.items}
+            onDone={handleManualOrderDone}
+            onCancel={handleManualReorderCancel}
           />
         )}
 
         {phase.name === 'stitching' && (
           <Progress
             label={
-              phase.ratio >= 1
+              phase.current >= phase.total || phase.ratio >= 1
                 ? 'Wrapping up...'
                 : 'Stitching your video...'
             }
@@ -297,7 +350,7 @@ function App() {
           </div>
         )}
 
-        {phase.name !== 'review' && showDiagnostics && (
+        {showDiagnostics && (
           <>
             {diagnostics && diagnostics.length > 0 && (
               <DiagnosticsPanel rows={diagnostics} />
@@ -318,7 +371,7 @@ function App() {
           className="cursor-pointer hover:text-neutral-600 transition-colors"
           aria-label="Toggle sort diagnostics"
         >
-          v1.3.3
+          v1.4.4
         </button>
       </footer>
     </div>
