@@ -20,6 +20,7 @@ import {
 import { CSS } from '@dnd-kit/utilities'
 import type { MediaItem } from '../lib/types'
 import { Thumbnail } from './Thumbnail'
+import { PreviewModal } from './PreviewModal'
 
 type View = 'list' | 'card'
 
@@ -36,6 +37,7 @@ interface Props {
 
 export function ManualReorder({ items, onDone, onCancel }: Props) {
   const [view, setView] = useState<View>('list')
+  const [preview, setPreview] = useState<MediaItem | null>(null)
   // Stable IDs for the duration of the reorder session. dnd-kit needs ids
   // that survive reordering, so we attach a UUID once and key everything by it.
   const [order, setOrder] = useState<OrderedItem[]>(() =>
@@ -99,13 +101,25 @@ export function ManualReorder({ items, onDone, onCancel }: Props) {
           {view === 'list' ? (
             <ul className="mt-5 flex flex-col gap-2">
               {order.map((o, i) => (
-                <SortableListRow key={o.id} id={o.id} position={i + 1} item={o.item} />
+                <SortableListRow
+                  key={o.id}
+                  id={o.id}
+                  position={i + 1}
+                  item={o.item}
+                  onPreview={() => setPreview(o.item)}
+                />
               ))}
             </ul>
           ) : (
             <div className="mt-5 grid grid-cols-3 gap-3">
               {order.map((o, i) => (
-                <SortableCard key={o.id} id={o.id} position={i + 1} item={o.item} />
+                <SortableCard
+                  key={o.id}
+                  id={o.id}
+                  position={i + 1}
+                  item={o.item}
+                  onPreview={() => setPreview(o.item)}
+                />
               ))}
             </div>
           )}
@@ -121,6 +135,8 @@ export function ManualReorder({ items, onDone, onCancel }: Props) {
           Continue with this order
         </button>
       </div>
+
+      {preview && <PreviewModal item={preview} onClose={() => setPreview(null)} />}
     </div>
   )
 }
@@ -166,10 +182,12 @@ function SortableListRow({
   id,
   position,
   item,
+  onPreview,
 }: {
   id: string
   position: number
   item: MediaItem
+  onPreview: () => void
 }) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id })
   const style = {
@@ -191,7 +209,11 @@ function SortableListRow({
       <span className="w-6 text-right text-xs font-medium tabular-nums text-neutral-400">
         {position}
       </span>
-      <Thumbnail item={item} className="h-12 w-12 flex-none rounded-md overflow-hidden" />
+      <Thumbnail
+        item={item}
+        onClick={onPreview}
+        className="h-12 w-12 flex-none rounded-md overflow-hidden"
+      />
       <span className="min-w-0 flex-1 truncate text-sm text-neutral-700">
         {item.file.name}
       </span>
@@ -204,10 +226,12 @@ function SortableCard({
   id,
   position,
   item,
+  onPreview,
 }: {
   id: string
   position: number
   item: MediaItem
+  onPreview: () => void
 }) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id })
   const style = {
@@ -226,8 +250,8 @@ function SortableCard({
           : 'border-neutral-200'
       }`}
     >
-      <Thumbnail item={item} className="aspect-square w-full" />
-      <span className="absolute left-1.5 top-1.5 rounded-full bg-black/70 px-2 py-0.5 text-[11px] font-medium tabular-nums text-white">
+      <Thumbnail item={item} onClick={onPreview} className="aspect-square w-full" />
+      <span className="absolute left-1.5 top-1.5 rounded-full bg-black/70 px-2 py-0.5 text-[11px] font-medium tabular-nums text-white pointer-events-none">
         {position}
       </span>
     </div>

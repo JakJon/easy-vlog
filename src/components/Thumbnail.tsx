@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, type MouseEvent } from 'react'
 import type { MediaItem } from '../lib/types'
 
 // Renders a thumbnail for a media item.
@@ -7,13 +7,14 @@ import type { MediaItem } from '../lib/types'
 // the viewport, then cached by File reference so view-toggles (list ↔ card)
 // don't re-create URLs.
 //
-// Videos: canvas frame extraction. Each video gets seeked to t=0.3, drawn to
-// an offscreen canvas, exported as a JPEG blob — the resulting blob URL is
-// the displayed <img>. The actual <video> element is destroyed as soon as the
-// frame is captured, and only one <video> is alive at a time across the whole
-// app (mobile Chrome caps simultaneous <video> elements around 16).
+// Videos: canvas frame extraction. We try several seek positions (start, 10%,
+// 25%, 50%) and pick the first non-dark frame — phone clips often have
+// fade-ins or black slates in the first second, which the naive "seek to
+// 0.3s" used to expose as solid black thumbnails. The actual <video> element
+// is destroyed as soon as the frame is captured, and only one is alive at a
+// time across the app.
 //
-// Both kinds use:
+// Both kinds:
 //   - WeakMap caches keyed by File so URLs survive component remounts (view
 //     toggle, drag-drop reorder churn) without re-doing the work.
 //   - IntersectionObserver-based lazy loading so opening Manual Reorder with
@@ -21,19 +22,24 @@ import type { MediaItem } from '../lib/types'
 //     all at once.
 //
 // Memory: blob URLs aren't explicitly revoked. Once the underlying File
-// objects go out of scope (after the user does a fresh upload), the WeakMap
-// entries are GC'd; the URLs become orphan handles and the browser cleans
-// them up on page unload. For typical session sizes (tens of items, small
-// JPEG thumbnails) this is fine.
+// objects go out of scope (after a fresh upload), the WeakMap entries are
+// GC'd; URLs become orphan handles and the browser cleans them up on page
+// unload.
 
 const imageObjectUrls = new WeakMap<File, string>()
 const videoFrameUrls = new WeakMap<File, string>()
 
-export function Thumbnail({ item, className }: { item: MediaItem; className?: string }) {
+interface ThumbnailProps {
+  item: MediaItem
+  className?: string
+  onClick?: () => void
+}
+
+export function Thumbnail({ item, className, onClick }: ThumbnailProps) {
   if (item.kind === 'image') {
-    return <ImageThumbnail file={item.file} className={className} />
+    return <ImageThumbnail file={item.file} className={className} onClick={onClick} />
   }
-  return <VideoThumbnail file={item.file} className={className} />
+  return <VideoThumbnail file={item.file} className={className} onClick={onClick} />
 }
 
 function useNearViewport(ref: React.RefObject<HTMLElement | null>, enabled: boolean) {
@@ -43,7 +49,6 @@ function useNearViewport(ref: React.RefObject<HTMLElement | null>, enabled: bool
     const el = ref.current
     if (!el) return
     if (typeof IntersectionObserver === 'undefined') {
-      // Old browser fallback: skip lazy gate.
       setVisible(true)
       return
     }
@@ -62,7 +67,25 @@ function useNearViewport(ref: React.RefObject<HTMLElement | null>, enabled: bool
   return visible
 }
 
-function ImageThumbnail({ file, className }: { file: File; className?: string }) {
+// stopPropagation so the click doesn't bubble up to whatever dnd-kit-listening
+// parent the thumbnail might be inside of.
+function makeClickHandler(onClick?: () => void) {
+  if (!onClick) return undefined
+  return (e: MouseEvent) => {
+    e.stopPropagation()
+    onClick()
+  }
+}
+
+function ImageThumbnail({
+  file,
+  className,
+  onClick,
+}: {
+  file: File
+  className?: string
+  onClick?: () => void
+}) {
   const cached = imageObjectUrls.get(file)
   const [url, setUrl] = useState<string | null>(cached ?? null)
   const [error, setError] = useState(false)
@@ -84,7 +107,8 @@ function ImageThumbnail({ file, className }: { file: File; className?: string })
   return (
     <div
       ref={ref}
-      className={`relative overflow-hidden bg-neutral-200 ${className ?? ''}`}
+      onClick={makeClickHandler(onClick)}
+      className={`relative overflow-hidden bg-neutral-200 ${onClick ? 'cursor-zoom-in' : ''} ${className ?? ''}`}
     >
       {url && !error && (
         <img
@@ -110,98 +134,167 @@ let extractionQueue: Promise<unknown> = Promise.resolve()
 
 function enqueueExtraction<T>(fn: () => Promise<T>): Promise<T> {
   const next = extractionQueue.then(fn, fn)
-  // Swallow rejections on the queue tail so one failure doesn't poison the chain.
   extractionQueue = next.catch(() => {})
   return next
 }
 
-function extractVideoFrame(file: File): Promise<string> {
+// Async helper: wait for a one-shot video event.
+function waitForVideoEvent(
+  video: HTMLVideoElement,
+  eventName: 'loadeddata' | 'seeked',
+  timeoutMs: number,
+): Promise<void> {
   return new Promise((resolve, reject) => {
-    const video = document.createElement('video')
-    video.muted = true
-    video.playsInline = true
-    video.preload = 'auto'
-
-    const objectUrl = URL.createObjectURL(file)
-    video.src = objectUrl
-
     let settled = false
-    const timeoutId = window.setTimeout(() => {
+    const timer = window.setTimeout(() => {
       if (settled) return
       settled = true
       cleanup()
-      reject(new Error('Video thumbnail extraction timed out'))
-    }, 8000)
-
+      reject(new Error(`${eventName} timed out`))
+    }, timeoutMs)
     function cleanup() {
-      video.removeAttribute('src')
-      try {
-        video.load()
-      } catch {
-        // ignore
-      }
-      URL.revokeObjectURL(objectUrl)
-      window.clearTimeout(timeoutId)
+      video.removeEventListener(eventName, onSuccess)
+      video.removeEventListener('error', onError)
+      window.clearTimeout(timer)
     }
-
-    video.onloadeddata = () => {
-      try {
-        const target = Math.min(0.3, (video.duration || 1) / 2)
-        video.currentTime = target
-      } catch (e) {
-        if (settled) return
-        settled = true
-        cleanup()
-        reject(e)
-      }
-    }
-
-    video.onseeked = () => {
-      if (settled) return
-      try {
-        const targetW = 320
-        const w = video.videoWidth
-        const h = video.videoHeight
-        if (!w || !h) throw new Error('Video has no dimensions')
-        const scale = targetW / w
-        const canvas = document.createElement('canvas')
-        canvas.width = targetW
-        canvas.height = Math.max(1, Math.round(h * scale))
-        const ctx = canvas.getContext('2d')
-        if (!ctx) throw new Error('No 2D canvas context')
-        ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
-        canvas.toBlob(
-          (blob) => {
-            if (settled) return
-            settled = true
-            cleanup()
-            if (!blob) {
-              reject(new Error('Canvas toBlob returned null'))
-              return
-            }
-            resolve(URL.createObjectURL(blob))
-          },
-          'image/jpeg',
-          0.78,
-        )
-      } catch (e) {
-        if (settled) return
-        settled = true
-        cleanup()
-        reject(e)
-      }
-    }
-
-    video.onerror = () => {
+    function onSuccess() {
       if (settled) return
       settled = true
       cleanup()
-      reject(new Error('Video failed to load'))
+      resolve()
     }
+    function onError() {
+      if (settled) return
+      settled = true
+      cleanup()
+      reject(new Error('Video error'))
+    }
+    video.addEventListener(eventName, onSuccess, { once: true })
+    video.addEventListener('error', onError, { once: true })
   })
 }
 
-function VideoThumbnail({ file, className }: { file: File; className?: string }) {
+function drawFrameToCanvas(video: HTMLVideoElement): HTMLCanvasElement | null {
+  const w = video.videoWidth
+  const h = video.videoHeight
+  if (!w || !h) return null
+  const targetW = 320
+  const scale = targetW / w
+  const canvas = document.createElement('canvas')
+  canvas.width = targetW
+  canvas.height = Math.max(1, Math.round(h * scale))
+  const ctx = canvas.getContext('2d')
+  if (!ctx) return null
+  ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
+  return canvas
+}
+
+// Samples a small center region and returns true if the average luminance is
+// near-black. Used to skip "still loading" or "fade-in" frames.
+function isFrameTooDark(canvas: HTMLCanvasElement): boolean {
+  const ctx = canvas.getContext('2d')
+  if (!ctx) return false
+  const sampleSize = Math.min(40, canvas.width, canvas.height)
+  const sx = Math.floor((canvas.width - sampleSize) / 2)
+  const sy = Math.floor((canvas.height - sampleSize) / 2)
+  try {
+    const data = ctx.getImageData(sx, sy, sampleSize, sampleSize).data
+    let total = 0
+    for (let i = 0; i < data.length; i += 4) {
+      total += 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]
+    }
+    const avg = total / (sampleSize * sampleSize)
+    return avg < 12 // < ~5% brightness ≈ black
+  } catch {
+    return false
+  }
+}
+
+function canvasToBlobUrl(canvas: HTMLCanvasElement): Promise<string> {
+  return new Promise((resolve, reject) => {
+    canvas.toBlob(
+      (blob) => {
+        if (blob) resolve(URL.createObjectURL(blob))
+        else reject(new Error('Canvas toBlob returned null'))
+      },
+      'image/jpeg',
+      0.78,
+    )
+  })
+}
+
+async function extractVideoFrame(file: File): Promise<string> {
+  const video = document.createElement('video')
+  video.muted = true
+  video.playsInline = true
+  video.preload = 'auto'
+  const objectUrl = URL.createObjectURL(file)
+  video.src = objectUrl
+
+  let fallbackUrl: string | null = null
+
+  try {
+    await waitForVideoEvent(video, 'loadeddata', 8000)
+    const duration = video.duration || 1
+    // Try multiple seek positions. Sorted from cheapest (near start) to deeper
+    // into the clip — phone fade-ins are usually under 1 second.
+    const rawCandidates = [
+      Math.min(0.3, duration / 2),
+      Math.min(1.2, duration * 0.1),
+      Math.min(3, duration * 0.25),
+      Math.min(8, duration * 0.5),
+    ]
+    const seen = new Set<number>()
+    const candidates = rawCandidates.filter((t) => {
+      const k = Math.round(t * 100)
+      if (seen.has(k) || t <= 0) return false
+      seen.add(k)
+      return true
+    })
+
+    for (const t of candidates) {
+      try {
+        video.currentTime = t
+        await waitForVideoEvent(video, 'seeked', 3000)
+      } catch {
+        continue
+      }
+      const canvas = drawFrameToCanvas(video)
+      if (!canvas) continue
+      if (!isFrameTooDark(canvas)) {
+        if (fallbackUrl) URL.revokeObjectURL(fallbackUrl)
+        return await canvasToBlobUrl(canvas)
+      }
+      // Save this dark frame as a fallback in case every position is black.
+      const darkUrl = await canvasToBlobUrl(canvas).catch(() => null)
+      if (darkUrl) {
+        if (fallbackUrl) URL.revokeObjectURL(fallbackUrl)
+        fallbackUrl = darkUrl
+      }
+    }
+
+    if (fallbackUrl) return fallbackUrl
+    throw new Error('Failed to extract any video frame')
+  } finally {
+    video.removeAttribute('src')
+    try {
+      video.load()
+    } catch {
+      // ignore
+    }
+    URL.revokeObjectURL(objectUrl)
+  }
+}
+
+function VideoThumbnail({
+  file,
+  className,
+  onClick,
+}: {
+  file: File
+  className?: string
+  onClick?: () => void
+}) {
   const cached = videoFrameUrls.get(file)
   const [url, setUrl] = useState<string | null>(cached ?? null)
   const [error, setError] = useState(false)
@@ -212,8 +305,6 @@ function VideoThumbnail({ file, className }: { file: File; className?: string })
   useEffect(() => {
     if (url || error) return
     if (!nearViewport) return
-    // Double-check the cache in case another component populated it while we
-    // were waiting in the viewport queue.
     const c = videoFrameUrls.get(file)
     if (c) {
       setUrl(c)
@@ -236,7 +327,8 @@ function VideoThumbnail({ file, className }: { file: File; className?: string })
   return (
     <div
       ref={ref}
-      className={`relative overflow-hidden bg-neutral-200 ${className ?? ''}`}
+      onClick={makeClickHandler(onClick)}
+      className={`relative overflow-hidden bg-neutral-200 ${onClick ? 'cursor-pointer' : ''} ${className ?? ''}`}
     >
       {url && (
         <img
