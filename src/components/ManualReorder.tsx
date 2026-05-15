@@ -103,7 +103,7 @@ export function ManualReorder({ items, onDone, onCancel }: Props) {
               ))}
             </ul>
           ) : (
-            <div className="mt-5 grid grid-cols-2 gap-3 sm:grid-cols-3">
+            <div className="mt-5 grid grid-cols-3 gap-3">
               {order.map((o, i) => (
                 <SortableCard key={o.id} id={o.id} position={i + 1} item={o.item} />
               ))}

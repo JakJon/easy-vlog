@@ -1,18 +1,33 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { MediaItem } from '../lib/types'
 
 // Renders a thumbnail for a media item.
 //
-// Images: object URL → <img>. State-based URL creation (not useMemo) so it's
-// created in the effect-commit phase, never during render — mobile browsers
-// otherwise aggressively GC URLs created mid-render.
+// Images: object URL → <img>. Created lazily once the element is in (or near)
+// the viewport, then cached by File reference so view-toggles (list ↔ card)
+// don't re-create URLs.
 //
-// Videos: canvas frame extraction. We load the video, seek to a small positive
-// time, draw the frame to an offscreen canvas, export as a JPEG blob, and use
-// THAT as the displayed <img>. The actual <video> element is destroyed as soon
-// as the frame is captured, so we never hold more than one active video at a
-// time across the entire app (mobile Chrome caps simultaneous <video> elements
-// around 16, which silently breaks half the thumbnails in long lists).
+// Videos: canvas frame extraction. Each video gets seeked to t=0.3, drawn to
+// an offscreen canvas, exported as a JPEG blob — the resulting blob URL is
+// the displayed <img>. The actual <video> element is destroyed as soon as the
+// frame is captured, and only one <video> is alive at a time across the whole
+// app (mobile Chrome caps simultaneous <video> elements around 16).
+//
+// Both kinds use:
+//   - WeakMap caches keyed by File so URLs survive component remounts (view
+//     toggle, drag-drop reorder churn) without re-doing the work.
+//   - IntersectionObserver-based lazy loading so opening Manual Reorder with
+//     30+ items doesn't try to decode 30+ images / extract 30+ video frames
+//     all at once.
+//
+// Memory: blob URLs aren't explicitly revoked. Once the underlying File
+// objects go out of scope (after the user does a fresh upload), the WeakMap
+// entries are GC'd; the URLs become orphan handles and the browser cleans
+// them up on page unload. For typical session sizes (tens of items, small
+// JPEG thumbnails) this is fine.
+
+const imageObjectUrls = new WeakMap<File, string>()
+const videoFrameUrls = new WeakMap<File, string>()
 
 export function Thumbnail({ item, className }: { item: MediaItem; className?: string }) {
   if (item.kind === 'image') {
@@ -21,19 +36,56 @@ export function Thumbnail({ item, className }: { item: MediaItem; className?: st
   return <VideoThumbnail file={item.file} className={className} />
 }
 
+function useNearViewport(ref: React.RefObject<HTMLElement | null>, enabled: boolean) {
+  const [visible, setVisible] = useState(false)
+  useEffect(() => {
+    if (!enabled) return
+    const el = ref.current
+    if (!el) return
+    if (typeof IntersectionObserver === 'undefined') {
+      // Old browser fallback: skip lazy gate.
+      setVisible(true)
+      return
+    }
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((e) => e.isIntersecting)) {
+          setVisible(true)
+          observer.disconnect()
+        }
+      },
+      { rootMargin: '300px' },
+    )
+    observer.observe(el)
+    return () => observer.disconnect()
+  }, [enabled, ref])
+  return visible
+}
+
 function ImageThumbnail({ file, className }: { file: File; className?: string }) {
-  const [url, setUrl] = useState<string | null>(null)
+  const cached = imageObjectUrls.get(file)
+  const [url, setUrl] = useState<string | null>(cached ?? null)
   const [error, setError] = useState(false)
+  const ref = useRef<HTMLDivElement>(null)
+  const needsLazy = url == null && !error
+  const nearViewport = useNearViewport(ref, needsLazy)
 
   useEffect(() => {
-    const u = URL.createObjectURL(file)
+    if (url || error) return
+    if (!nearViewport) return
+    let u = imageObjectUrls.get(file)
+    if (!u) {
+      u = URL.createObjectURL(file)
+      imageObjectUrls.set(file, u)
+    }
     setUrl(u)
-    setError(false)
-    return () => URL.revokeObjectURL(u)
-  }, [file])
+  }, [file, url, error, nearViewport])
 
   return (
-    <div className={`relative overflow-hidden bg-neutral-200 ${className ?? ''}`}>
+    <div
+      ref={ref}
+      className={`relative overflow-hidden bg-neutral-200 ${className ?? ''}`}
+    >
       {url && !error && (
         <img
           src={url}
@@ -44,7 +96,7 @@ function ImageThumbnail({ file, className }: { file: File; className?: string })
         />
       )}
       {error && (
-        <div className="flex h-full w-full items-center justify-center text-[10px] font-medium text-neutral-400">
+        <div className="absolute inset-0 flex items-center justify-center text-[10px] font-medium text-neutral-400">
           IMG
         </div>
       )}
@@ -94,7 +146,6 @@ function extractVideoFrame(file: File): Promise<string> {
 
     video.onloadeddata = () => {
       try {
-        // Seek slightly past start so we render a real frame, not a black one.
         const target = Math.min(0.3, (video.duration || 1) / 2)
         video.currentTime = target
       } catch (e) {
@@ -151,34 +202,49 @@ function extractVideoFrame(file: File): Promise<string> {
 }
 
 function VideoThumbnail({ file, className }: { file: File; className?: string }) {
-  const [url, setUrl] = useState<string | null>(null)
+  const cached = videoFrameUrls.get(file)
+  const [url, setUrl] = useState<string | null>(cached ?? null)
   const [error, setError] = useState(false)
+  const ref = useRef<HTMLDivElement>(null)
+  const needsLazy = url == null && !error
+  const nearViewport = useNearViewport(ref, needsLazy)
 
   useEffect(() => {
+    if (url || error) return
+    if (!nearViewport) return
+    // Double-check the cache in case another component populated it while we
+    // were waiting in the viewport queue.
+    const c = videoFrameUrls.get(file)
+    if (c) {
+      setUrl(c)
+      return
+    }
     let active = true
-    let frameUrl: string | null = null
     enqueueExtraction(() => extractVideoFrame(file))
       .then((u) => {
-        if (!active) {
-          URL.revokeObjectURL(u)
-          return
-        }
-        frameUrl = u
-        setUrl(u)
+        videoFrameUrls.set(file, u)
+        if (active) setUrl(u)
       })
       .catch(() => {
         if (active) setError(true)
       })
     return () => {
       active = false
-      if (frameUrl) URL.revokeObjectURL(frameUrl)
     }
-  }, [file])
+  }, [file, url, error, nearViewport])
 
   return (
-    <div className={`relative overflow-hidden bg-neutral-200 ${className ?? ''}`}>
+    <div
+      ref={ref}
+      className={`relative overflow-hidden bg-neutral-200 ${className ?? ''}`}
+    >
       {url && (
-        <img src={url} alt="" decoding="async" className="h-full w-full object-cover" />
+        <img
+          src={url}
+          alt=""
+          decoding="async"
+          className="h-full w-full object-cover"
+        />
       )}
       {!url && !error && (
         <div className="absolute inset-0 flex items-center justify-center">
