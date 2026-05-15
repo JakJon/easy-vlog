@@ -7,6 +7,7 @@ import { PickerMetadataPanel } from './components/PickerMetadataPanel'
 import { ReviewScreen } from './components/ReviewScreen'
 import { ReorderOptionsScreen } from './components/ReorderOptionsScreen'
 import { ManualReorder } from './components/ManualReorder'
+import { precachePreviews } from './components/Thumbnail'
 import { Progress } from './components/Progress'
 import { DoneScreen } from './components/DoneScreen'
 import {
@@ -56,6 +57,12 @@ function App() {
       current: 0,
       ratio: 0,
     })
+    // Pre-extract thumbnails BEFORE the stitch reads (and on Android Chrome,
+    // detaches) the underlying Files. Without this, Manual Reorder opened
+    // after stitch shows IMG/VID placeholders because the originals are no
+    // longer readable. Cheap if the cache is already populated from the
+    // background precache kicked off in handleFiles.
+    await precachePreviews(items.map((it) => ({ file: it.file, kind: it.kind })))
     const blob = await stitchMedia(items, optionsRef.current, ({ current, total, ratio }) => {
       setPhase({ name: 'stitching', total, current, ratio })
     })
@@ -103,6 +110,10 @@ function App() {
           })
           return
         }
+        // Fire-and-forget: start pre-extracting thumbnails now so they're
+        // ready by the time Manual Reorder opens. runStitch awaits the same
+        // promise via cache dedup before it touches the originals.
+        void precachePreviews(items.map((it) => ({ file: it.file, kind: it.kind })))
         const unreliableCount = diag.filter((d) => d.source === 'lastModified').length
         if (unreliableCount > 0) {
           setPhase({ name: 'review', items, unreliableCount })
@@ -441,7 +452,7 @@ function App() {
           className="cursor-pointer hover:text-neutral-600 transition-colors"
           aria-label="Toggle sort diagnostics"
         >
-          v1.4.9
+          v1.5.0
         </button>
       </footer>
     </div>

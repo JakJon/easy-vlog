@@ -1,161 +1,112 @@
 import { useEffect, useRef, useState, type MouseEvent } from 'react'
-import type { MediaItem } from '../lib/types'
+import type { MediaItem, MediaKind } from '../lib/types'
 
-// Renders a thumbnail for a media item.
+// Pre-extracted, in-memory thumbnail/preview cache.
 //
-// Images: object URL → <img>. Created lazily once the element is in (or near)
-// the viewport, then cached by File reference so view-toggles (list ↔ card)
-// don't re-create URLs.
+// Why: on Android Chrome with File objects sourced from content URIs (Photo
+// Picker, gallery share), once any operation reads the underlying blob — via
+// createImageBitmap, file.arrayBuffer, video.src=..., etc. — subsequent reads
+// can fail because the content-URI grant is effectively one-shot. The stitch
+// pipeline reads every File during encoding, so by the time the user opens
+// Manual Reorder POST-stitch, fresh blob URLs derived from the original Files
+// don't actually load.
 //
-// Videos: canvas frame extraction. We try several seek positions (start, 10%,
-// 25%, 50%) and pick the first non-dark frame — phone clips often have
-// fade-ins or black slates in the first second, which the naive "seek to
-// 0.3s" used to expose as solid black thumbnails. The actual <video> element
-// is destroyed as soon as the frame is captured, and only one is alive at a
-// time across the app.
+// Workaround: read each File once, up front, and store a compact in-memory
+// JPEG blob URL. Manual Reorder thumbnails and image PreviewModal both pull
+// from this cache. The in-memory blob URLs are immune to whatever happens to
+// the original File afterwards.
 //
-// Both kinds:
-//   - WeakMap caches keyed by File so URLs survive component remounts (view
-//     toggle, drag-drop reorder churn) without re-doing the work.
-//   - IntersectionObserver-based lazy loading so opening Manual Reorder with
-//     30+ items doesn't try to decode 30+ images / extract 30+ video frames
-//     all at once.
+// Sizes:
+//   - Image preview: ~1280px wide JPEG, q=0.85 (≈ 150 KB each, < 5 MB for 30)
+//   - Video frame:   ~320px wide JPEG, q=0.78 (≈ 30 KB each)
 //
-// Memory: blob URLs aren't explicitly revoked. Once the underlying File
-// objects go out of scope (after a fresh upload), the WeakMap entries are
-// GC'd; URLs become orphan handles and the browser cleans them up on page
-// unload.
+// Memory: blob URLs aren't explicitly revoked. WeakMap GC's the entry once
+// the underlying File goes out of scope (i.e. after a fresh upload).
 
-const imageObjectUrls = new WeakMap<File, string>()
-const videoFrameUrls = new WeakMap<File, string>()
+const previewCache = new WeakMap<File, string>()
+const inProgress = new Map<File, Promise<string>>()
+// Video frame extraction runs serially because mobile Chrome caps simultaneous
+// active <video> elements around 16; serialising avoids the cap entirely.
+let videoQueue: Promise<unknown> = Promise.resolve()
 
-interface ThumbnailProps {
-  item: MediaItem
-  className?: string
-  onClick?: () => void
+export function getPreviewUrl(file: File): string | undefined {
+  return previewCache.get(file)
 }
 
-export function Thumbnail({ item, className, onClick }: ThumbnailProps) {
-  if (item.kind === 'image') {
-    return <ImageThumbnail file={item.file} className={className} onClick={onClick} />
-  }
-  return <VideoThumbnail file={item.file} className={className} onClick={onClick} />
-}
-
-function useNearViewport(ref: React.RefObject<HTMLElement | null>, enabled: boolean) {
-  const [visible, setVisible] = useState(false)
-  useEffect(() => {
-    if (!enabled) return
-    const el = ref.current
-    if (!el) return
-    if (typeof IntersectionObserver === 'undefined') {
-      setVisible(true)
-      return
-    }
-    const observer = new IntersectionObserver(
-      (entries) => {
-        if (entries.some((e) => e.isIntersecting)) {
-          setVisible(true)
-          observer.disconnect()
-        }
-      },
-      { rootMargin: '300px' },
-    )
-    observer.observe(el)
-    return () => observer.disconnect()
-  }, [enabled, ref])
-  return visible
-}
-
-// stopPropagation so the click doesn't bubble up to whatever dnd-kit-listening
-// parent the thumbnail might be inside of.
-function makeClickHandler(onClick?: () => void) {
-  if (!onClick) return undefined
-  return (e: MouseEvent) => {
-    e.stopPropagation()
-    onClick()
-  }
-}
-
-function ImageThumbnail({
-  file,
-  className,
-  onClick,
-}: {
+interface PrecacheItem {
   file: File
-  className?: string
-  onClick?: () => void
-}) {
-  const cached = imageObjectUrls.get(file)
-  const [url, setUrl] = useState<string | null>(cached ?? null)
-  const [error, setError] = useState(false)
-  const [retried, setRetried] = useState(false)
-  const ref = useRef<HTMLDivElement>(null)
-  const needsLazy = url == null && !error
-  const nearViewport = useNearViewport(ref, needsLazy)
-
-  useEffect(() => {
-    if (url || error) return
-    if (!nearViewport) return
-    let u = imageObjectUrls.get(file)
-    if (!u) {
-      u = URL.createObjectURL(file)
-      imageObjectUrls.set(file, u)
-    }
-    setUrl(u)
-  }, [file, url, error, nearViewport])
-
-  // Some images fail on first paint after a re-stitch — most often when the
-  // cached URL was created during a prior render cycle that's no longer valid.
-  // First failure: drop the cached URL, mint a fresh one, try again. Only the
-  // second consecutive failure shows the placeholder.
-  const handleError = () => {
-    if (retried) {
-      setError(true)
-      return
-    }
-    setRetried(true)
-    imageObjectUrls.delete(file)
-    const fresh = URL.createObjectURL(file)
-    imageObjectUrls.set(file, fresh)
-    setUrl(fresh)
-  }
-
-  return (
-    <div
-      ref={ref}
-      onClick={makeClickHandler(onClick)}
-      className={`relative overflow-hidden bg-neutral-200 ${onClick ? 'cursor-zoom-in' : ''} ${className ?? ''}`}
-    >
-      {url && !error && (
-        <img
-          src={url}
-          alt=""
-          decoding="async"
-          onError={handleError}
-          className="h-full w-full object-cover"
-        />
-      )}
-      {error && (
-        <div className="absolute inset-0 flex items-center justify-center text-[10px] font-medium text-neutral-400">
-          IMG
-        </div>
-      )}
-    </div>
-  )
+  kind: MediaKind
 }
 
-// Shared sequential queue. Each video thumbnail extraction is appended to the
-// chain so only one <video> element is alive at any moment.
-let extractionQueue: Promise<unknown> = Promise.resolve()
+// Fire-and-forget or awaitable. Resolves when every input has either been
+// successfully extracted or has errored out. Failures are swallowed per-item
+// so one bad file doesn't block the rest.
+export function precachePreviews(items: PrecacheItem[]): Promise<void> {
+  return Promise.all(
+    items.map((item) =>
+      extractPreviewWithCache(item.file, item.kind).catch(() => undefined),
+    ),
+  ).then(() => undefined)
+}
 
-function enqueueExtraction<T>(fn: () => Promise<T>): Promise<T> {
-  const next = extractionQueue.then(fn, fn)
-  extractionQueue = next.catch(() => {})
+function extractPreviewWithCache(file: File, kind: MediaKind): Promise<string> {
+  const cached = previewCache.get(file)
+  if (cached) return Promise.resolve(cached)
+  const existing = inProgress.get(file)
+  if (existing) return existing
+  const promise = (async () => {
+    let url: string
+    if (kind === 'image') {
+      url = await extractImagePreview(file)
+    } else {
+      url = await runOnVideoQueue(() => extractVideoFrame(file))
+    }
+    previewCache.set(file, url)
+    inProgress.delete(file)
+    return url
+  })()
+  inProgress.set(file, promise)
+  return promise
+}
+
+function runOnVideoQueue<T>(fn: () => Promise<T>): Promise<T> {
+  const next = videoQueue.then(fn, fn)
+  videoQueue = next.catch(() => undefined)
   return next
 }
 
-// Async helper: wait for a one-shot video event.
+async function extractImagePreview(file: File): Promise<string> {
+  // Copy bytes into an in-memory Blob before createImageBitmap. Without the
+  // copy, content-URI-backed Files end up unreadable after this call.
+  const bytes = await file.arrayBuffer()
+  const blob = new Blob([bytes], { type: file.type || 'image/jpeg' })
+  const bitmap = await createImageBitmap(blob)
+  try {
+    const targetW = 1280
+    const scale = Math.min(1, targetW / bitmap.width)
+    const w = Math.max(1, Math.round(bitmap.width * scale))
+    const h = Math.max(1, Math.round(bitmap.height * scale))
+    const canvas = document.createElement('canvas')
+    canvas.width = w
+    canvas.height = h
+    const ctx = canvas.getContext('2d')
+    if (!ctx) throw new Error('No 2D canvas context')
+    ctx.drawImage(bitmap, 0, 0, w, h)
+    return await new Promise<string>((resolve, reject) => {
+      canvas.toBlob(
+        (b) => {
+          if (b) resolve(URL.createObjectURL(b))
+          else reject(new Error('Canvas toBlob returned null'))
+        },
+        'image/jpeg',
+        0.85,
+      )
+    })
+  } finally {
+    bitmap.close()
+  }
+}
+
 function waitForVideoEvent(
   video: HTMLVideoElement,
   eventName: 'loadeddata' | 'seeked',
@@ -206,8 +157,6 @@ function drawFrameToCanvas(video: HTMLVideoElement): HTMLCanvasElement | null {
   return canvas
 }
 
-// Samples a small center region and returns true if the average luminance is
-// near-black. Used to skip "still loading" or "fade-in" frames.
 function isFrameTooDark(canvas: HTMLCanvasElement): boolean {
   const ctx = canvas.getContext('2d')
   if (!ctx) return false
@@ -221,7 +170,7 @@ function isFrameTooDark(canvas: HTMLCanvasElement): boolean {
       total += 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]
     }
     const avg = total / (sampleSize * sampleSize)
-    return avg < 12 // < ~5% brightness ≈ black
+    return avg < 12
   } catch {
     return false
   }
@@ -253,8 +202,6 @@ async function extractVideoFrame(file: File): Promise<string> {
   try {
     await waitForVideoEvent(video, 'loadeddata', 8000)
     const duration = video.duration || 1
-    // Try multiple seek positions. Sorted from cheapest (near start) to deeper
-    // into the clip — phone fade-ins are usually under 1 second.
     const rawCandidates = [
       Math.min(0.3, duration / 2),
       Math.min(1.2, duration * 0.1),
@@ -282,7 +229,6 @@ async function extractVideoFrame(file: File): Promise<string> {
         if (fallbackUrl) URL.revokeObjectURL(fallbackUrl)
         return await canvasToBlobUrl(canvas)
       }
-      // Save this dark frame as a fallback in case every position is black.
       const darkUrl = await canvasToBlobUrl(canvas).catch(() => null)
       if (darkUrl) {
         if (fallbackUrl) URL.revokeObjectURL(fallbackUrl)
@@ -303,16 +249,16 @@ async function extractVideoFrame(file: File): Promise<string> {
   }
 }
 
-function VideoThumbnail({
-  file,
-  className,
-  onClick,
-}: {
-  file: File
+// ─── Components ────────────────────────────────────────────────────────────
+
+interface ThumbnailProps {
+  item: MediaItem
   className?: string
   onClick?: () => void
-}) {
-  const cached = videoFrameUrls.get(file)
+}
+
+export function Thumbnail({ item, className, onClick }: ThumbnailProps) {
+  const cached = previewCache.get(item.file)
   const [url, setUrl] = useState<string | null>(cached ?? null)
   const [error, setError] = useState(false)
   const ref = useRef<HTMLDivElement>(null)
@@ -322,15 +268,9 @@ function VideoThumbnail({
   useEffect(() => {
     if (url || error) return
     if (!nearViewport) return
-    const c = videoFrameUrls.get(file)
-    if (c) {
-      setUrl(c)
-      return
-    }
     let active = true
-    enqueueExtraction(() => extractVideoFrame(file))
+    extractPreviewWithCache(item.file, item.kind)
       .then((u) => {
-        videoFrameUrls.set(file, u)
         if (active) setUrl(u)
       })
       .catch(() => {
@@ -339,7 +279,7 @@ function VideoThumbnail({
     return () => {
       active = false
     }
-  }, [file, url, error, nearViewport])
+  }, [item.file, item.kind, url, error, nearViewport])
 
   return (
     <div
@@ -347,7 +287,7 @@ function VideoThumbnail({
       onClick={makeClickHandler(onClick)}
       className={`relative overflow-hidden bg-neutral-200 ${onClick ? 'cursor-pointer' : ''} ${className ?? ''}`}
     >
-      {url && (
+      {url && !error && (
         <img
           src={url}
           alt=""
@@ -362,15 +302,50 @@ function VideoThumbnail({
       )}
       {error && (
         <div className="absolute inset-0 flex items-center justify-center text-[10px] font-medium text-neutral-400">
-          VID
+          {item.kind === 'video' ? 'VID' : 'IMG'}
         </div>
       )}
-      <span
-        aria-hidden
-        className="absolute right-1 bottom-1 flex h-5 w-5 items-center justify-center rounded-full bg-black/70 text-[10px] leading-none text-white"
-      >
-        ▶
-      </span>
+      {item.kind === 'video' && (
+        <span
+          aria-hidden
+          className="absolute right-1 bottom-1 flex h-5 w-5 items-center justify-center rounded-full bg-black/70 text-[10px] leading-none text-white"
+        >
+          ▶
+        </span>
+      )}
     </div>
   )
+}
+
+function useNearViewport(ref: React.RefObject<HTMLElement | null>, enabled: boolean) {
+  const [visible, setVisible] = useState(false)
+  useEffect(() => {
+    if (!enabled) return
+    const el = ref.current
+    if (!el) return
+    if (typeof IntersectionObserver === 'undefined') {
+      setVisible(true)
+      return
+    }
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((e) => e.isIntersecting)) {
+          setVisible(true)
+          observer.disconnect()
+        }
+      },
+      { rootMargin: '300px' },
+    )
+    observer.observe(el)
+    return () => observer.disconnect()
+  }, [enabled, ref])
+  return visible
+}
+
+function makeClickHandler(onClick?: () => void) {
+  if (!onClick) return undefined
+  return (e: MouseEvent) => {
+    e.stopPropagation()
+    onClick()
+  }
 }
