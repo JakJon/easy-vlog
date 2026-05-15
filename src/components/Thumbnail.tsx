@@ -89,6 +89,7 @@ function ImageThumbnail({
   const cached = imageObjectUrls.get(file)
   const [url, setUrl] = useState<string | null>(cached ?? null)
   const [error, setError] = useState(false)
+  const [retried, setRetried] = useState(false)
   const ref = useRef<HTMLDivElement>(null)
   const needsLazy = url == null && !error
   const nearViewport = useNearViewport(ref, needsLazy)
@@ -104,6 +105,22 @@ function ImageThumbnail({
     setUrl(u)
   }, [file, url, error, nearViewport])
 
+  // Some images fail on first paint after a re-stitch — most often when the
+  // cached URL was created during a prior render cycle that's no longer valid.
+  // First failure: drop the cached URL, mint a fresh one, try again. Only the
+  // second consecutive failure shows the placeholder.
+  const handleError = () => {
+    if (retried) {
+      setError(true)
+      return
+    }
+    setRetried(true)
+    imageObjectUrls.delete(file)
+    const fresh = URL.createObjectURL(file)
+    imageObjectUrls.set(file, fresh)
+    setUrl(fresh)
+  }
+
   return (
     <div
       ref={ref}
@@ -115,7 +132,7 @@ function ImageThumbnail({
           src={url}
           alt=""
           decoding="async"
-          onError={() => setError(true)}
+          onError={handleError}
           className="h-full w-full object-cover"
         />
       )}

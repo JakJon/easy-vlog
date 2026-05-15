@@ -218,7 +218,15 @@ async function processImage(opts: ImageOpts): Promise<void> {
     tickUs,
     errBox,
   } = opts
-  const bitmap = await createImageBitmap(file)
+  // Copy bytes into an in-memory Blob before passing to createImageBitmap.
+  // On Android Chrome (notably with File objects sourced from the system
+  // Photo Picker / content URIs), createImageBitmap(File) can leave the
+  // underlying blob unusable for subsequent reads — even after the bitmap is
+  // closed. That breaks later <img src=blob:...> thumbnails and the preview
+  // modal. Using an in-memory Blob copy sidesteps the detach.
+  const bytes = await file.arrayBuffer()
+  const blob = new Blob([bytes], { type: file.type || 'image/jpeg' })
+  const bitmap = await createImageBitmap(blob)
   try {
     drawContain(ctx, bitmap, canvas.width, canvas.height, 0)
   } finally {
