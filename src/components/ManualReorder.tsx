@@ -69,7 +69,15 @@ export function ManualReorder({ items, onDone, onCancel }: Props) {
 
   return (
     <div className="rounded-2xl border border-neutral-200 bg-white px-6 py-8">
-      <div className="flex flex-col items-center gap-2 sm:flex-row sm:justify-between">
+      <button
+        type="button"
+        onClick={onCancel}
+        className="-ml-1 inline-flex items-center gap-1 text-sm font-medium text-neutral-500 hover:text-neutral-700"
+        aria-label="Back"
+      >
+        <span aria-hidden>←</span> Back
+      </button>
+      <div className="mt-4 flex flex-col items-center gap-2 sm:flex-row sm:justify-between">
         <h3 className="text-xl font-semibold text-neutral-900">Reorder your items</h3>
         <ViewToggle value={view} onChange={setView} />
       </div>
@@ -104,20 +112,13 @@ export function ManualReorder({ items, onDone, onCancel }: Props) {
         </SortableContext>
       </DndContext>
 
-      <div className="mt-7 flex flex-col items-center gap-3">
+      <div className="mt-7 flex justify-center">
         <button
           type="button"
           onClick={() => onDone(order.map((o) => o.item))}
           className="rounded-full bg-emerald-500 px-8 py-3 text-base font-semibold text-white hover:bg-emerald-400 active:bg-emerald-600 transition-colors"
         >
           Continue with this order
-        </button>
-        <button
-          type="button"
-          onClick={onCancel}
-          className="text-sm font-medium text-neutral-500 underline hover:text-neutral-700"
-        >
-          Back
         </button>
       </div>
     </div>

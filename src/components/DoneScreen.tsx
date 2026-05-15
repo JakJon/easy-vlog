@@ -2,9 +2,10 @@ interface Props {
   videoUrl: string
   onSave: () => void
   onReset: () => void
+  onReorder: () => void
 }
 
-export function DoneScreen({ videoUrl, onSave, onReset }: Props) {
+export function DoneScreen({ videoUrl, onSave, onReset, onReorder }: Props) {
   return (
     <div className="rounded-2xl border border-neutral-200 bg-white px-8 py-10 text-center">
       <h3 className="text-2xl font-semibold text-neutral-900">
@@ -24,6 +25,17 @@ export function DoneScreen({ videoUrl, onSave, onReset }: Props) {
       >
         Save
       </button>
+
+      <div className="mt-6 flex flex-col items-center gap-2">
+        <p className="text-sm text-neutral-500">Not looking quite right?</p>
+        <button
+          type="button"
+          onClick={onReorder}
+          className="rounded-full border border-emerald-500 px-6 py-2 text-sm font-semibold text-emerald-600 hover:bg-emerald-50 transition-colors"
+        >
+          Reorder
+        </button>
+      </div>
 
       <div className="mt-10 border-t border-neutral-100 pt-6">
         <p className="text-neutral-600 mb-3">Should we make another?</p>

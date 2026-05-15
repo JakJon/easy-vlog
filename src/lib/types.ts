@@ -26,7 +26,13 @@ export type AppPhase =
   | { name: 'converting'; total: number; current: number }
   | { name: 'sorting'; total: number }
   | { name: 'review'; items: MediaItem[]; unreliableCount: number }
-  | { name: 'reorder'; items: MediaItem[] }
+  | {
+      name: 'reorder'
+      items: MediaItem[]
+      // Where the user came from. Determines what the Back arrow does.
+      from: 'review' | 'reorder-options' | 'done'
+    }
+  | { name: 'reorder-options'; items: MediaItem[] }
   | { name: 'matching'; pickerPhase: string; pickerUri?: string }
   | { name: 'stitching'; total: number; current: number; ratio: number }
   | { name: 'done'; blob: Blob; url: string }

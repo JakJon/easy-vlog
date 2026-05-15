@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useRef, useState } from 'react'
 import { Header } from './components/Header'
 import { UploadZone } from './components/UploadZone'
 import { Options } from './components/Options'
 import { DiagnosticsPanel } from './components/DiagnosticsPanel'
 import { PickerMetadataPanel } from './components/PickerMetadataPanel'
 import { ReviewScreen } from './components/ReviewScreen'
+import { ReorderOptionsScreen } from './components/ReorderOptionsScreen'
 import { ManualReorder } from './components/ManualReorder'
 import { Progress } from './components/Progress'
 import { DoneScreen } from './components/DoneScreen'
@@ -38,16 +39,17 @@ function App() {
   // so changes mid-flight don't retarget the in-progress encode.
   const optionsRef = useRef(options)
   optionsRef.current = options
+  // Latest items used in the most recent stitch — needed when the user clicks
+  // Reorder on the done screen and we need the items list back to feed into
+  // the reorder phase (the done phase only carries blob+url).
+  const lastItemsRef = useRef<MediaItem[] | null>(null)
+  // Snapshot of the done state taken just before entering reorder/reorder-options
+  // from done. Lets the Back arrow restore the previous video without re-stitching.
+  const savedDoneRef = useRef<{ blob: Blob; url: string } | null>(null)
   const webCodecsSupported = isWebCodecsSupported()
 
-  // Revoke any object URL when leaving the done state.
-  useEffect(() => {
-    return () => {
-      if (phase.name === 'done') URL.revokeObjectURL(phase.url)
-    }
-  }, [phase])
-
   const runStitch = useCallback(async (items: MediaItem[]) => {
+    lastItemsRef.current = items
     setPhase({
       name: 'stitching',
       total: items.length,
@@ -58,6 +60,8 @@ function App() {
       setPhase({ name: 'stitching', total, current, ratio })
     })
     const url = URL.createObjectURL(blob)
+    // We re-stitched, so the old saved-done snapshot is now obsolete. Drop it.
+    savedDoneRef.current = null
     setPhase({ name: 'done', blob, url })
   }, [])
 
@@ -114,28 +118,41 @@ function App() {
 
   const handleMatched = useCallback(
     async (metadata: PickerMetadata[]) => {
-      // Pull the files that are currently in review and re-run buildMediaItems
-      // with the picker timestamps applied as overrides.
-      if (phase.name !== 'review') return
+      // Smart Sort can be triggered from either the initial review screen
+      // (when uploads contain unreliable timestamps) or from the reorder-options
+      // screen (when the user clicked Reorder on the done view).
+      if (phase.name !== 'review' && phase.name !== 'reorder-options') return
       try {
-        // Only attempt matching on unreliable items. Reliable items already
-        // have a trustworthy timestamp source; including them in the match
-        // can mis-pair items when Pass 3 (sorted pairing) kicks in and naming
-        // families are mixed.
         const allFiles = phase.items.map((it) => it.file)
-        const unreliableFiles: File[] = []
-        for (let i = 0; i < phase.items.length; i++) {
-          if (diagnostics?.[i]?.source === 'lastModified') {
-            unreliableFiles.push(phase.items[i].file)
+        // Review: only match unreliable items to avoid clobbering correct
+        // EXIF photos. Reorder-options: trust the user's explicit ask and
+        // match against ALL files — they wanted Google's dates applied.
+        let filesToMatch: File[]
+        if (phase.name === 'reorder-options') {
+          filesToMatch = allFiles
+        } else {
+          filesToMatch = []
+          for (let i = 0; i < phase.items.length; i++) {
+            if (diagnostics?.[i]?.source === 'lastModified') {
+              filesToMatch.push(phase.items[i].file)
+            }
           }
         }
-        const known = matchFilesToPickerMetadata(unreliableFiles, metadata)
+        const known = matchFilesToPickerMetadata(filesToMatch, metadata)
         setLastMatchAttempt({
           pickerMetadata: metadata,
           matchedCount: known.size,
         })
         const { items, diagnostics: diag } = await buildMediaItems(allFiles, known)
         setDiagnostics(diag)
+
+        if (phase.name === 'reorder-options') {
+          // User explicitly chose to reorder — re-stitch immediately, no review.
+          await runStitch(items)
+          return
+        }
+
+        // Review path: branch on remaining unreliable count.
         const stillUnreliable = diag.filter((d) => d.source === 'lastModified').length
         if (stillUnreliable > 0) {
           setPhase({ name: 'review', items, unreliableCount: stillUnreliable })
@@ -158,10 +175,34 @@ function App() {
     }
   }, [phase, runStitch, reportError])
 
+  // Enter manual reorder from the initial review screen.
   const handleManualReorder = useCallback(() => {
     if (phase.name !== 'review') return
-    setPhase({ name: 'reorder', items: phase.items })
+    setPhase({ name: 'reorder', items: phase.items, from: 'review' })
   }, [phase])
+
+  // Enter manual reorder from the reorder-options screen.
+  const handleManualReorderFromOptions = useCallback(() => {
+    if (phase.name !== 'reorder-options') return
+    setPhase({ name: 'reorder', items: phase.items, from: 'reorder-options' })
+  }, [phase])
+
+  // From the done screen, the Reorder button branches:
+  //   - if smart sort was already used in this session → straight to manual reorder
+  //   - otherwise → present the two-option screen first
+  const handleReorderFromDone = useCallback(() => {
+    if (phase.name !== 'done') return
+    const items = lastItemsRef.current
+    if (!items) return
+    // Snapshot current done state so the Back arrow can restore it without
+    // re-stitching.
+    savedDoneRef.current = { blob: phase.blob, url: phase.url }
+    if (lastMatchAttempt) {
+      setPhase({ name: 'reorder', items, from: 'done' })
+    } else {
+      setPhase({ name: 'reorder-options', items })
+    }
+  }, [phase, lastMatchAttempt])
 
   const handleManualOrderDone = useCallback(
     async (reordered: MediaItem[]) => {
@@ -189,22 +230,41 @@ function App() {
     [phase, runStitch, reportError],
   )
 
+  // Back arrow on manual reorder routes by where the user came from.
   const handleManualReorderCancel = useCallback(() => {
     if (phase.name !== 'reorder') return
-    // Calculate how many items were unreliable from the diagnostics that
-    // were in place when we entered reorder. If diagnostics is missing for
-    // any reason, fall back to assuming "all of them" so the review screen
-    // still renders.
-    const unreliable = diagnostics
-      ? diagnostics.filter((d) => d.source === 'lastModified').length
-      : phase.items.length
-    setPhase({ name: 'review', items: phase.items, unreliableCount: unreliable })
+    switch (phase.from) {
+      case 'review': {
+        const unreliable = diagnostics
+          ? diagnostics.filter((d) => d.source === 'lastModified').length
+          : phase.items.length
+        setPhase({ name: 'review', items: phase.items, unreliableCount: unreliable })
+        return
+      }
+      case 'reorder-options': {
+        setPhase({ name: 'reorder-options', items: phase.items })
+        return
+      }
+      case 'done': {
+        // Restore the snapshotted done state — saves a re-stitch.
+        if (savedDoneRef.current) {
+          setPhase({ name: 'done', blob: savedDoneRef.current.blob, url: savedDoneRef.current.url })
+          savedDoneRef.current = null
+          return
+        }
+        // Shouldn't happen, but fall back to idle if the snapshot got dropped.
+        setPhase({ name: 'idle' })
+        return
+      }
+    }
   }, [phase, diagnostics])
 
   const reset = useCallback(() => {
     setPhase({ name: 'idle' })
     setDiagnostics(null)
     setLastMatchAttempt(null)
+    lastItemsRef.current = null
+    savedDoneRef.current = null
   }, [])
 
   return (
@@ -300,6 +360,15 @@ function App() {
           />
         )}
 
+        {phase.name === 'reorder-options' && (
+          <ReorderOptionsScreen
+            lastMatchAttempt={lastMatchAttempt}
+            onMatched={handleMatched}
+            onManualReorder={handleManualReorderFromOptions}
+            onError={(message) => setPhase({ name: 'error', message })}
+          />
+        )}
+
         {phase.name === 'reorder' && (
           <ManualReorder
             items={phase.items}
@@ -326,6 +395,7 @@ function App() {
             videoUrl={phase.url}
             onSave={() => saveBlob(phase.blob, 'easy-vlog.mp4')}
             onReset={reset}
+            onReorder={handleReorderFromDone}
           />
         )}
 
@@ -371,7 +441,7 @@ function App() {
           className="cursor-pointer hover:text-neutral-600 transition-colors"
           aria-label="Toggle sort diagnostics"
         >
-          v1.4.4
+          v1.4.5
         </button>
       </footer>
     </div>
