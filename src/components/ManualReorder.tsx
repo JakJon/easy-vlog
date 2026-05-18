@@ -33,9 +33,13 @@ interface Props {
   items: MediaItem[]
   onDone: (orderedItems: MediaItem[]) => void
   onCancel: () => void
+  // Items for which we couldn't get a real timestamp (we fell back to
+  // file.lastModified). Highlighted in amber so the user can pay extra
+  // attention when ordering them.
+  isUnreliable?: (item: MediaItem) => boolean
 }
 
-export function ManualReorder({ items, onDone, onCancel }: Props) {
+export function ManualReorder({ items, onDone, onCancel, isUnreliable }: Props) {
   const [view, setView] = useState<View>('list')
   const [preview, setPreview] = useState<MediaItem | null>(null)
   // Stable IDs for the duration of the reorder session. dnd-kit needs ids
@@ -106,6 +110,7 @@ export function ManualReorder({ items, onDone, onCancel }: Props) {
                   id={o.id}
                   position={i + 1}
                   item={o.item}
+                  unreliable={isUnreliable?.(o.item) ?? false}
                   onPreview={() => setPreview(o.item)}
                 />
               ))}
@@ -118,6 +123,7 @@ export function ManualReorder({ items, onDone, onCancel }: Props) {
                   id={o.id}
                   position={i + 1}
                   item={o.item}
+                  unreliable={isUnreliable?.(o.item) ?? false}
                   onPreview={() => setPreview(o.item)}
                 />
               ))}
@@ -182,11 +188,13 @@ function SortableListRow({
   id,
   position,
   item,
+  unreliable,
   onPreview,
 }: {
   id: string
   position: number
   item: MediaItem
+  unreliable: boolean
   onPreview: () => void
 }) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id })
@@ -194,17 +202,19 @@ function SortableListRow({
     transform: CSS.Transform.toString(transform),
     transition,
   }
+  const borderClass = isDragging
+    ? 'border-emerald-400 shadow-lg ring-2 ring-emerald-200'
+    : unreliable
+      ? 'border-amber-400 ring-1 ring-amber-200'
+      : 'border-neutral-200'
   return (
     <li
       ref={setNodeRef}
       style={style}
       {...attributes}
       {...listeners}
-      className={`flex items-center gap-3 rounded-xl border bg-white px-3 py-2 touch-none select-none ${
-        isDragging
-          ? 'border-emerald-400 shadow-lg ring-2 ring-emerald-200'
-          : 'border-neutral-200'
-      }`}
+      className={`flex items-center gap-3 rounded-xl border bg-white px-3 py-2 touch-none select-none ${borderClass}`}
+      title={unreliable ? 'Timestamp unreliable (file last-modified used)' : undefined}
     >
       <span className="w-6 text-right text-xs font-medium tabular-nums text-neutral-400">
         {position}
@@ -226,11 +236,13 @@ function SortableCard({
   id,
   position,
   item,
+  unreliable,
   onPreview,
 }: {
   id: string
   position: number
   item: MediaItem
+  unreliable: boolean
   onPreview: () => void
 }) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id })
@@ -238,17 +250,19 @@ function SortableCard({
     transform: CSS.Transform.toString(transform),
     transition,
   }
+  const borderClass = isDragging
+    ? 'border-emerald-400 shadow-lg ring-2 ring-emerald-200'
+    : unreliable
+      ? 'border-amber-400 ring-1 ring-amber-200'
+      : 'border-neutral-200'
   return (
     <div
       ref={setNodeRef}
       style={style}
       {...attributes}
       {...listeners}
-      className={`relative overflow-hidden rounded-xl border bg-white touch-none select-none ${
-        isDragging
-          ? 'border-emerald-400 shadow-lg ring-2 ring-emerald-200'
-          : 'border-neutral-200'
-      }`}
+      className={`relative overflow-hidden rounded-xl border bg-white touch-none select-none ${borderClass}`}
+      title={unreliable ? 'Timestamp unreliable (file last-modified used)' : undefined}
     >
       <Thumbnail item={item} onClick={onPreview} className="aspect-square w-full" />
       <span className="absolute left-1.5 top-1.5 rounded-full bg-black/70 px-2 py-0.5 text-[11px] font-medium tabular-nums text-white pointer-events-none">

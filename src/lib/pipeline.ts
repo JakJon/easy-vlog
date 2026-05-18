@@ -1,6 +1,7 @@
 import { createFile, DataStream, Endianness, type MP4BoxBuffer, type Sample } from 'mp4box'
 import { Muxer, ArrayBufferTarget } from 'mp4-muxer'
 import type { MediaItem, StitchOptions } from './types'
+import { diagLog } from './diagLog'
 
 const LANDSCAPE_W = 1920
 const LANDSCAPE_H = 1080
@@ -588,7 +589,7 @@ async function processVideoAudio(
       TARGET_AUDIO_CHANNELS,
     )
   } catch (e) {
-    console.warn('[webcodecs] audio decode failed, using silence', e)
+    diagLog('warn', '[audio] decode failed, using silence', e)
   }
 
   if (!decoded) {
@@ -688,35 +689,95 @@ async function decodeMp4AudioTrack(
   targetRate: number,
   targetChannels: number,
 ): Promise<AudioBuffer | null> {
-  const extracted = await extractMp4AudioSamples(fileBytes)
-  if (!extracted) return null
-  const { channels, sampleRate, numberOfChannels } = extracted
-  const frameCount = channels[0]?.length ?? 0
+  // Path 1: mp4box + WebCodecs AudioDecoder. This is the primary path and
+  // works on Chrome / Edge. It handles iPhone-recorded HEVC+AAC MP4s where
+  // AudioContext.decodeAudioData silently fails (the original bug).
+  let primaryError: unknown = null
+  try {
+    const extracted = await extractMp4AudioSamples(fileBytes)
+    if (extracted) {
+      const sourceBuffer = buildAudioBuffer(extracted)
+      if (sourceBuffer) return await resampleIfNeeded(sourceBuffer, targetRate, targetChannels)
+      return null
+    }
+    // extracted === null → genuinely no audio track. Don't try decodeAudioData —
+    // it can't synthesize audio that isn't there.
+    return null
+  } catch (e) {
+    primaryError = e
+    diagLog(
+      'warn',
+      '[audio] WebCodecs AudioDecoder path failed, falling back to Web Audio',
+      e,
+    )
+  }
+
+  // Path 2: AudioContext.decodeAudioData. The fallback exists primarily for
+  // iOS Safari, where WebCodecs AudioDecoder may not accept iPhone AAC files
+  // or where AudioData.copyTo format conversion isn't implemented. On iOS,
+  // decodeAudioData natively handles iPhone-recorded MP4s without issue.
+  try {
+    const tmpCtx = new AudioContext()
+    let decoded: AudioBuffer
+    try {
+      decoded = await tmpCtx.decodeAudioData(fileBytes.slice(0))
+    } finally {
+      tmpCtx.close()
+    }
+    if (primaryError !== null) {
+      diagLog('info', '[audio] Web Audio fallback succeeded after WebCodecs path failed')
+    }
+    return await resampleIfNeeded(decoded, targetRate, targetChannels)
+  } catch (e) {
+    diagLog(
+      'error',
+      '[audio] both WebCodecs AND Web Audio paths failed; emitting silence',
+      `webaudio: ${e instanceof Error ? e.message : String(e)} | webcodecs: ${primaryError instanceof Error ? primaryError.message : String(primaryError)}`,
+    )
+    return null
+  }
+}
+
+function buildAudioBuffer(extracted: ExtractedAudio): AudioBuffer | null {
+  const frameCount = extracted.channels[0]?.length ?? 0
   if (frameCount === 0) return null
-
-  // Build an AudioBuffer at the source rate. We need an OfflineAudioContext
-  // either way (to allocate the buffer when rates match, or to resample when
-  // they don't).
-  const sourceCtx = new OfflineAudioContext({
-    numberOfChannels,
+  const ctx = new OfflineAudioContext({
+    numberOfChannels: extracted.numberOfChannels,
     length: frameCount,
-    sampleRate,
+    sampleRate: extracted.sampleRate,
   })
-  const sourceBuffer = sourceCtx.createBuffer(numberOfChannels, frameCount, sampleRate)
-  for (let ch = 0; ch < numberOfChannels; ch++) {
-    sourceBuffer.getChannelData(ch).set(channels[ch])
+  const buffer = ctx.createBuffer(
+    extracted.numberOfChannels,
+    frameCount,
+    extracted.sampleRate,
+  )
+  for (let ch = 0; ch < extracted.numberOfChannels; ch++) {
+    buffer.getChannelData(ch).set(extracted.channels[ch])
   }
-  if (sampleRate === targetRate && numberOfChannels === targetChannels) {
-    return sourceBuffer
-  }
+  return buffer
+}
 
+async function resampleIfNeeded(
+  buffer: AudioBuffer,
+  targetRate: number,
+  targetChannels: number,
+): Promise<AudioBuffer> {
+  if (
+    buffer.sampleRate === targetRate &&
+    buffer.numberOfChannels === targetChannels
+  ) {
+    return buffer
+  }
   const offline = new OfflineAudioContext({
     numberOfChannels: targetChannels,
-    length: Math.max(1, Math.ceil((frameCount / sampleRate) * targetRate)),
+    length: Math.max(
+      1,
+      Math.ceil((buffer.length / buffer.sampleRate) * targetRate),
+    ),
     sampleRate: targetRate,
   })
   const src = offline.createBufferSource()
-  src.buffer = sourceBuffer
+  src.buffer = buffer
   src.connect(offline.destination)
   src.start()
   return await offline.startRendering()
@@ -807,13 +868,21 @@ async function extractMp4AudioSamples(
                 `AudioDecoder rejected ${audioTrack.codec} @ ${sourceRate}Hz × ${sourceChannels}ch`,
               )
             }
+            let loggedFormat = false
             decoderRef.current = new AudioDecoder({
               output: (data) => {
+                if (!loggedFormat) {
+                  loggedFormat = true
+                  diagLog(
+                    'info',
+                    `[audio] AudioDecoder output: codec=${audioTrack.codec} format=${data.format ?? 'undefined'} rate=${data.sampleRate}Hz ch=${data.numberOfChannels}`,
+                  )
+                }
                 decodedChunks.push(data)
               },
               error: (e) => {
                 decodeError = e instanceof Error ? e : new Error(String(e))
-                console.error('[webcodecs] AudioDecoder error', e)
+                diagLog('error', '[audio] AudioDecoder runtime error', e)
               },
             })
             decoderRef.current.configure(r.config)
@@ -876,10 +945,12 @@ async function extractMp4AudioSamples(
         }
         let offset = 0
         for (const chunk of decodedChunks) {
+          const chunkChannels = audioDataToChannels(chunk)
           for (let ch = 0; ch < sourceChannels; ch++) {
-            const tmp = new Float32Array(chunk.numberOfFrames)
-            chunk.copyTo(tmp, { planeIndex: ch, format: 'f32-planar' })
-            channels[ch].set(tmp, offset)
+            // Fall back to channel 0 (mono) if the chunk has fewer channels
+            // than the track header claims.
+            const src = chunkChannels[ch] ?? chunkChannels[0]
+            if (src) channels[ch].set(src, offset)
           }
           offset += chunk.numberOfFrames
           chunk.close()
@@ -891,6 +962,113 @@ async function extractMp4AudioSamples(
       }
     })()
   })
+}
+
+// Read an AudioData chunk's PCM samples into per-channel Float32Arrays
+// normalized to [-1, 1]. We dispatch on the chunk's native format rather than
+// asking copyTo to convert: iOS Safari's WebCodecs implementation throws
+// NotSupportedError on format conversion (the AAC decoder there outputs a
+// fixed native format, not f32-planar), which used to take down the whole
+// audio path and emit silence.
+function audioDataToChannels(chunk: AudioData): Float32Array[] {
+  const channels = chunk.numberOfChannels
+  const frames = chunk.numberOfFrames
+  const out: Float32Array[] = []
+  for (let ch = 0; ch < channels; ch++) out.push(new Float32Array(frames))
+
+  const format = chunk.format
+  try {
+    switch (format) {
+      case 'f32-planar': {
+        for (let ch = 0; ch < channels; ch++) {
+          chunk.copyTo(out[ch], { planeIndex: ch })
+        }
+        return out
+      }
+      case 'f32': {
+        const buf = new Float32Array(frames * channels)
+        chunk.copyTo(buf, { planeIndex: 0 })
+        for (let i = 0; i < frames; i++) {
+          for (let ch = 0; ch < channels; ch++) {
+            out[ch][i] = buf[i * channels + ch]
+          }
+        }
+        return out
+      }
+      case 's16-planar': {
+        for (let ch = 0; ch < channels; ch++) {
+          const buf = new Int16Array(frames)
+          chunk.copyTo(buf, { planeIndex: ch })
+          const dest = out[ch]
+          for (let i = 0; i < frames; i++) dest[i] = buf[i] / 32768
+        }
+        return out
+      }
+      case 's16': {
+        const buf = new Int16Array(frames * channels)
+        chunk.copyTo(buf, { planeIndex: 0 })
+        for (let i = 0; i < frames; i++) {
+          for (let ch = 0; ch < channels; ch++) {
+            out[ch][i] = buf[i * channels + ch] / 32768
+          }
+        }
+        return out
+      }
+      case 's32-planar': {
+        for (let ch = 0; ch < channels; ch++) {
+          const buf = new Int32Array(frames)
+          chunk.copyTo(buf, { planeIndex: ch })
+          const dest = out[ch]
+          for (let i = 0; i < frames; i++) dest[i] = buf[i] / 2147483648
+        }
+        return out
+      }
+      case 's32': {
+        const buf = new Int32Array(frames * channels)
+        chunk.copyTo(buf, { planeIndex: 0 })
+        for (let i = 0; i < frames; i++) {
+          for (let ch = 0; ch < channels; ch++) {
+            out[ch][i] = buf[i * channels + ch] / 2147483648
+          }
+        }
+        return out
+      }
+      case 'u8-planar': {
+        for (let ch = 0; ch < channels; ch++) {
+          const buf = new Uint8Array(frames)
+          chunk.copyTo(buf, { planeIndex: ch })
+          const dest = out[ch]
+          for (let i = 0; i < frames; i++) dest[i] = (buf[i] - 128) / 128
+        }
+        return out
+      }
+      case 'u8': {
+        const buf = new Uint8Array(frames * channels)
+        chunk.copyTo(buf, { planeIndex: 0 })
+        for (let i = 0; i < frames; i++) {
+          for (let ch = 0; ch < channels; ch++) {
+            out[ch][i] = (buf[i * channels + ch] - 128) / 128
+          }
+        }
+        return out
+      }
+      default: {
+        // Unknown / undefined format. Best-effort: try f32-planar as it's the
+        // most common output. If THAT throws, leave zeros and log.
+        for (let ch = 0; ch < channels; ch++) {
+          chunk.copyTo(out[ch], { planeIndex: ch, format: 'f32-planar' })
+        }
+        return out
+      }
+    }
+  } catch (e) {
+    diagLog(
+      'warn',
+      `[audio] AudioData.copyTo failed for format=${format}; leaving silence`,
+      e,
+    )
+    return out
+  }
 }
 
 function extractAudioSpecificConfig(

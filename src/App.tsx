@@ -4,6 +4,7 @@ import { UploadZone } from './components/UploadZone'
 import { Options } from './components/Options'
 import { DiagnosticsPanel } from './components/DiagnosticsPanel'
 import { PickerMetadataPanel } from './components/PickerMetadataPanel'
+import { AudioLogPanel } from './components/AudioLogPanel'
 import { ReviewScreen } from './components/ReviewScreen'
 import { ReadyScreen } from './components/ReadyScreen'
 import { ManualReorder } from './components/ManualReorder'
@@ -394,13 +395,27 @@ function App() {
           />
         )}
 
-        {phase.name === 'reorder' && (
-          <ManualReorder
-            items={phase.items}
-            onDone={handleManualOrderDone}
-            onCancel={handleManualReorderCancel}
-          />
-        )}
+        {phase.name === 'reorder' && (() => {
+          // diagnostics[i] corresponds to phase.items[i] — build a Set of File
+          // references whose timestamp came from file.lastModified so the
+          // reorder UI can flag them in amber.
+          const unreliableFiles = new Set<File>()
+          if (diagnostics) {
+            for (let i = 0; i < phase.items.length && i < diagnostics.length; i++) {
+              if (diagnostics[i].source === 'lastModified') {
+                unreliableFiles.add(phase.items[i].file)
+              }
+            }
+          }
+          return (
+            <ManualReorder
+              items={phase.items}
+              onDone={handleManualOrderDone}
+              onCancel={handleManualReorderCancel}
+              isUnreliable={(item) => unreliableFiles.has(item.file)}
+            />
+          )
+        })()}
 
         {phase.name === 'stitching' && (
           <Progress
@@ -447,6 +462,11 @@ function App() {
           </div>
         )}
 
+        {/* Runtime log is always rendered (it self-hides when empty) so iOS
+            users see audio-decode diagnostics without needing the version-
+            click toggle that desktop debugging uses. */}
+        <AudioLogPanel />
+
         {showDiagnostics && (
           <>
             {diagnostics && diagnostics.length > 0 && (
@@ -468,7 +488,7 @@ function App() {
           className="cursor-pointer hover:text-neutral-600 transition-colors"
           aria-label="Toggle sort diagnostics"
         >
-          v1.5.5
+          v1.5.7
         </button>
       </footer>
     </div>
