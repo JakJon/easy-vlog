@@ -575,17 +575,20 @@ async function processVideoAudio(
 ): Promise<void> {
   const { audioEncoder, audioStartSamples, errBox } = opts
 
-  // Decode the entire audio track from the input file via Web Audio.
-  // This handles AAC/MP4 natively and resamples to TARGET_SAMPLE_RATE.
+  // Extract the AAC track via mp4box + WebCodecs AudioDecoder and resample.
+  // We don't use AudioContext.decodeAudioData here because it silently fails
+  // on a lot of iPhone MP4s (HE-AAC, mixed video/audio containers with edit
+  // lists) — the catch used to swallow the error and emit silence for the
+  // whole clip.
   let decoded: AudioBuffer | null = null
   try {
-    decoded = await decodeAndResampleAudio(
+    decoded = await decodeMp4AudioTrack(
       fileBytes,
       TARGET_SAMPLE_RATE,
       TARGET_AUDIO_CHANNELS,
     )
-  } catch {
-    // Decode failed — emitSilence path below covers it.
+  } catch (e) {
+    console.warn('[webcodecs] audio decode failed, using silence', e)
   }
 
   if (!decoded) {
@@ -680,36 +683,273 @@ async function readVideoDurationSeconds(file: File): Promise<number> {
   }
 }
 
-async function decodeAndResampleAudio(
+async function decodeMp4AudioTrack(
   fileBytes: ArrayBuffer,
   targetRate: number,
   targetChannels: number,
-): Promise<AudioBuffer> {
-  // Use a temporary AudioContext to decode at native rate, then render
-  // through OfflineAudioContext at targetRate to resample.
-  const tmpCtx = new AudioContext()
-  let decoded: AudioBuffer
-  try {
-    decoded = await tmpCtx.decodeAudioData(fileBytes.slice(0))
-  } finally {
-    tmpCtx.close()
+): Promise<AudioBuffer | null> {
+  const extracted = await extractMp4AudioSamples(fileBytes)
+  if (!extracted) return null
+  const { channels, sampleRate, numberOfChannels } = extracted
+  const frameCount = channels[0]?.length ?? 0
+  if (frameCount === 0) return null
+
+  // Build an AudioBuffer at the source rate. We need an OfflineAudioContext
+  // either way (to allocate the buffer when rates match, or to resample when
+  // they don't).
+  const sourceCtx = new OfflineAudioContext({
+    numberOfChannels,
+    length: frameCount,
+    sampleRate,
+  })
+  const sourceBuffer = sourceCtx.createBuffer(numberOfChannels, frameCount, sampleRate)
+  for (let ch = 0; ch < numberOfChannels; ch++) {
+    sourceBuffer.getChannelData(ch).set(channels[ch])
   }
-  if (
-    decoded.sampleRate === targetRate &&
-    decoded.numberOfChannels === targetChannels
-  ) {
-    return decoded
+  if (sampleRate === targetRate && numberOfChannels === targetChannels) {
+    return sourceBuffer
   }
+
   const offline = new OfflineAudioContext({
     numberOfChannels: targetChannels,
-    length: Math.ceil((decoded.length / decoded.sampleRate) * targetRate),
+    length: Math.max(1, Math.ceil((frameCount / sampleRate) * targetRate)),
     sampleRate: targetRate,
   })
   const src = offline.createBufferSource()
-  src.buffer = decoded
+  src.buffer = sourceBuffer
   src.connect(offline.destination)
   src.start()
   return await offline.startRendering()
+}
+
+interface ExtractedAudio {
+  channels: Float32Array[]
+  sampleRate: number
+  numberOfChannels: number
+}
+
+async function extractMp4AudioSamples(
+  fileBytes: ArrayBuffer,
+): Promise<ExtractedAudio | null> {
+  return new Promise<ExtractedAudio | null>((resolve, reject) => {
+    const mp4 = createFile()
+    const decoderRef: { current: AudioDecoder | null } = { current: null }
+    const decodedChunks: AudioData[] = []
+    const pendingSamples: Sample[] = []
+    let audioTrackId: number | null = null
+    let hasAudioTrack = false
+    let configured = false
+    let sourceRate = 0
+    let sourceChannels = 0
+    let decodeError: Error | null = null
+
+    let decoderReadyResolve!: () => void
+    let decoderReadyReject!: (e: Error) => void
+    const decoderReady = new Promise<void>((res, rej) => {
+      decoderReadyResolve = res
+      decoderReadyReject = rej
+    })
+
+    mp4.onError = (msg: string) => reject(new Error('mp4box audio: ' + msg))
+
+    const decodeSample = (s: Sample) => {
+      if (!s.data || !decoderRef.current) return
+      // AAC has no inter-frame prediction — every access unit is a sync sample.
+      decoderRef.current.decode(
+        new EncodedAudioChunk({
+          type: 'key',
+          timestamp: Math.max(0, (s.cts * 1_000_000) / s.timescale),
+          duration: (s.duration * 1_000_000) / s.timescale,
+          data: s.data,
+        }),
+      )
+    }
+
+    mp4.onReady = (info) => {
+      try {
+        const audioTrack = info.tracks.find((t) => t.type === 'audio')
+        if (!audioTrack) {
+          decoderReadyResolve()
+          return
+        }
+        hasAudioTrack = true
+        audioTrackId = audioTrack.id
+        const audioInfo = audioTrack.audio as {
+          sample_rate: number
+          channel_count: number
+        }
+        sourceRate = audioInfo.sample_rate
+        sourceChannels = audioInfo.channel_count
+
+        const trak = mp4.getTrackById(audioTrack.id) as unknown as TrakWithStsd
+        const entry = trak.mdia?.minf?.stbl?.stsd?.entries?.[0]
+        const description = entry?.esds
+          ? extractAudioSpecificConfig(entry.esds, fileBytes)
+          : undefined
+
+        // Same pattern as the video path: enable extraction synchronously so
+        // mp4box starts emitting samples in this appendBuffer call, then
+        // configure the decoder asynchronously and drain buffered samples.
+        mp4.setExtractionOptions(audioTrack.id, null, { nbSamples: 128 })
+        mp4.start()
+
+        void (async () => {
+          try {
+            const baseCfg: AudioDecoderConfig = {
+              codec: audioTrack.codec,
+              sampleRate: sourceRate,
+              numberOfChannels: sourceChannels,
+            }
+            const cfg = description ? { ...baseCfg, description } : baseCfg
+            const r = await AudioDecoder.isConfigSupported(cfg)
+            if (!r.supported || !r.config) {
+              throw new Error(
+                `AudioDecoder rejected ${audioTrack.codec} @ ${sourceRate}Hz × ${sourceChannels}ch`,
+              )
+            }
+            decoderRef.current = new AudioDecoder({
+              output: (data) => {
+                decodedChunks.push(data)
+              },
+              error: (e) => {
+                decodeError = e instanceof Error ? e : new Error(String(e))
+                console.error('[webcodecs] AudioDecoder error', e)
+              },
+            })
+            decoderRef.current.configure(r.config)
+            configured = true
+            for (const s of pendingSamples) decodeSample(s)
+            pendingSamples.length = 0
+            decoderReadyResolve()
+          } catch (e) {
+            decoderReadyReject(e instanceof Error ? e : new Error(String(e)))
+          }
+        })()
+      } catch (e) {
+        decoderReadyReject(e instanceof Error ? e : new Error(String(e)))
+      }
+    }
+
+    mp4.onSamples = (id, _user, samples: Sample[]) => {
+      try {
+        if (id !== audioTrackId) return
+        for (const s of samples) {
+          if (!s.data) continue
+          if (configured && decoderRef.current) decodeSample(s)
+          else pendingSamples.push(s)
+        }
+      } catch (e) {
+        decoderReadyReject(e instanceof Error ? e : new Error(String(e)))
+      }
+    }
+
+    void (async () => {
+      try {
+        const buf = fileBytes.slice(0) as MP4BoxBuffer
+        ;(buf as MP4BoxBuffer).fileStart = 0
+        mp4.appendBuffer(buf)
+        await decoderReady
+        if (!hasAudioTrack) {
+          resolve(null)
+          return
+        }
+        mp4.flush()
+        const dec = decoderRef.current
+        if (dec) {
+          await dec.flush()
+          dec.close()
+        }
+        if (decodeError) throw decodeError
+
+        const totalFrames = decodedChunks.reduce(
+          (sum, c) => sum + c.numberOfFrames,
+          0,
+        )
+        if (totalFrames === 0) {
+          for (const c of decodedChunks) c.close()
+          resolve(null)
+          return
+        }
+        const channels: Float32Array[] = []
+        for (let ch = 0; ch < sourceChannels; ch++) {
+          channels.push(new Float32Array(totalFrames))
+        }
+        let offset = 0
+        for (const chunk of decodedChunks) {
+          for (let ch = 0; ch < sourceChannels; ch++) {
+            const tmp = new Float32Array(chunk.numberOfFrames)
+            chunk.copyTo(tmp, { planeIndex: ch, format: 'f32-planar' })
+            channels[ch].set(tmp, offset)
+          }
+          offset += chunk.numberOfFrames
+          chunk.close()
+        }
+        resolve({ channels, sampleRate: sourceRate, numberOfChannels: sourceChannels })
+      } catch (e) {
+        for (const c of decodedChunks) c.close()
+        reject(e instanceof Error ? e : new Error(String(e)))
+      }
+    })()
+  })
+}
+
+function extractAudioSpecificConfig(
+  esdsBox: PositionedBox,
+  fileBytes: ArrayBuffer,
+): Uint8Array | undefined {
+  // esds payload is a chain of MPEG-4 descriptors:
+  //   ES_DescrTag(0x03) → DecoderConfigDescrTag(0x04) → DecSpecificInfoTag(0x05)
+  // The DecSpecificInfo bytes are the AudioSpecificConfig the AudioDecoder needs.
+  // mp4box's hdr_size for FullBoxes includes the 4-byte version+flags, but we
+  // try both offsets in case behavior differs across mp4box versions.
+  if (
+    typeof esdsBox.start !== 'number' ||
+    typeof esdsBox.size !== 'number' ||
+    typeof esdsBox.hdr_size !== 'number'
+  ) return undefined
+  const end = esdsBox.start + esdsBox.size
+  if (end > fileBytes.byteLength) return undefined
+  for (const start of [esdsBox.start + esdsBox.hdr_size, esdsBox.start + esdsBox.hdr_size + 4]) {
+    if (start >= end) continue
+    const dsi = parseEsdsDescriptors(new Uint8Array(fileBytes, start, end - start))
+    if (dsi) return dsi
+  }
+  return undefined
+}
+
+function parseEsdsDescriptors(b: Uint8Array): Uint8Array | undefined {
+  let i = 0
+  const readVarSize = (): { size: number; consumed: number } => {
+    let size = 0
+    let consumed = 0
+    while (consumed < 4 && i + consumed < b.length) {
+      const byte = b[i + consumed]
+      size = (size << 7) | (byte & 0x7f)
+      consumed++
+      if (!(byte & 0x80)) break
+    }
+    return { size, consumed }
+  }
+  if (b[i++] !== 0x03) return undefined
+  i += readVarSize().consumed
+  i += 2 // ES_ID
+  if (i >= b.length) return undefined
+  const esFlags = b[i++]
+  if (esFlags & 0x80) i += 2
+  if (esFlags & 0x40) {
+    if (i >= b.length) return undefined
+    const urlLen = b[i++]
+    i += urlLen
+  }
+  if (esFlags & 0x20) i += 2
+  if (i >= b.length || b[i++] !== 0x04) return undefined
+  i += readVarSize().consumed
+  i += 13 // objectTypeIndication + streamType flags + bufferSizeDB + maxBitrate + avgBitrate
+  if (i >= b.length || b[i++] !== 0x05) return undefined
+  const dsi = readVarSize()
+  i += dsi.consumed
+  if (dsi.size === 0 || i + dsi.size > b.length) return undefined
+  return b.slice(i, i + dsi.size)
 }
 
 function drawContain(
@@ -771,6 +1011,7 @@ interface TrakWithStsd {
             hvcC?: PositionedBox
             vpcC?: PositionedBox
             av1C?: PositionedBox
+            esds?: PositionedBox
           }>
         }
       }

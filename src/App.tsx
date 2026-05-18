@@ -452,7 +452,7 @@ function App() {
           className="cursor-pointer hover:text-neutral-600 transition-colors"
           aria-label="Toggle sort diagnostics"
         >
-          v1.5.0
+          v1.5.1
         </button>
       </footer>
     </div>
