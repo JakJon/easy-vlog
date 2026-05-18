@@ -31,22 +31,24 @@ export function ReadyScreen({
           can sort them yourself first.
         </p>
 
-        <div className="mt-6 flex flex-col items-center gap-3">
-          <button
-            type="button"
-            onClick={onStart}
-            className="rounded-full bg-emerald-500 px-10 py-4 text-lg font-semibold text-white shadow-[0_0_30px_rgba(16,185,129,0.45)] hover:bg-emerald-400 active:bg-emerald-600 transition-colors"
-          >
-            Start
-          </button>
-          <button
-            type="button"
-            onClick={onSort}
-            className="rounded-full border border-emerald-500 px-7 py-3 text-base font-semibold text-emerald-600 hover:bg-emerald-50 transition-colors"
-          >
-            Sort
-          </button>
-          <UploadMoreButton onFiles={onUploadMore} />
+        <div className="mt-6 flex justify-center">
+          <div className="flex w-fit flex-col gap-3">
+            <button
+              type="button"
+              onClick={onStart}
+              className="w-full rounded-full bg-emerald-500 px-10 py-4 text-lg font-semibold text-white shadow-[0_0_30px_rgba(16,185,129,0.45)] hover:bg-emerald-400 active:bg-emerald-600 transition-colors"
+            >
+              Start
+            </button>
+            <button
+              type="button"
+              onClick={onSort}
+              className="w-full rounded-full border border-emerald-500 px-7 py-3 text-base font-semibold text-emerald-600 hover:bg-emerald-50 transition-colors"
+            >
+              Sort
+            </button>
+            <UploadMoreButton onFiles={onUploadMore} className="w-full" />
+          </div>
         </div>
       </div>
 

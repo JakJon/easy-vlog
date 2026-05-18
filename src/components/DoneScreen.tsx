@@ -44,18 +44,21 @@ export function DoneScreen({ videoUrl, onSave, onReset, onSort, onUploadMore }: 
           </button>
         ) : (
           <div className="flex flex-col items-center gap-3">
-            <UploadMoreButton
-              onFiles={onUploadMore}
-              label="Upload more videos?"
-              variant="secondary"
-            />
-            <button
-              type="button"
-              onClick={onSort}
-              className="rounded-full border border-emerald-500 px-7 py-3 text-base font-semibold text-emerald-600 hover:bg-emerald-50 transition-colors"
-            >
-              Sort videos?
-            </button>
+            <div className="flex w-fit flex-col gap-3">
+              <UploadMoreButton
+                onFiles={onUploadMore}
+                label="Upload more videos?"
+                variant="secondary"
+                className="w-full"
+              />
+              <button
+                type="button"
+                onClick={onSort}
+                className="w-full rounded-full border border-emerald-500 px-7 py-3 text-base font-semibold text-emerald-600 hover:bg-emerald-50 transition-colors"
+              >
+                Sort videos?
+              </button>
+            </div>
             <button
               type="button"
               onClick={() => setEditing(false)}

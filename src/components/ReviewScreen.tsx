@@ -69,29 +69,31 @@ export function ReviewScreen({
           />
         )}
 
-        <div className="mt-6 flex flex-col items-center gap-3">
-          <button
-            type="button"
-            onClick={() => setView('smart-sort')}
-            className="rounded-full bg-emerald-500 px-7 py-3 text-base font-semibold text-white hover:bg-emerald-400 active:bg-emerald-600 transition-colors"
-          >
-            Google Photos Smart Sort
-          </button>
-          <button
-            type="button"
-            onClick={onManualReorder}
-            className="rounded-full border border-emerald-500 px-7 py-3 text-base font-semibold text-emerald-600 hover:bg-emerald-50 transition-colors"
-          >
-            Manually reorder
-          </button>
-          <button
-            type="button"
-            onClick={onStitchAnyway}
-            className="rounded-full border border-neutral-300 px-7 py-3 text-base font-semibold text-neutral-600 hover:bg-neutral-50 transition-colors"
-          >
-            Continue anyway
-          </button>
-          <UploadMoreButton onFiles={onUploadMore} />
+        <div className="mt-6 flex justify-center">
+          <div className="flex w-fit flex-col gap-3">
+            <button
+              type="button"
+              onClick={() => setView('smart-sort')}
+              className="w-full rounded-full bg-emerald-500 px-7 py-3 text-base font-semibold text-white hover:bg-emerald-400 active:bg-emerald-600 transition-colors"
+            >
+              Google Photos Smart Sort
+            </button>
+            <button
+              type="button"
+              onClick={onManualReorder}
+              className="w-full rounded-full border border-emerald-500 px-7 py-3 text-base font-semibold text-emerald-600 hover:bg-emerald-50 transition-colors"
+            >
+              Manually reorder
+            </button>
+            <button
+              type="button"
+              onClick={onStitchAnyway}
+              className="w-full rounded-full border border-neutral-300 px-7 py-3 text-base font-semibold text-neutral-600 hover:bg-neutral-50 transition-colors"
+            >
+              Continue anyway
+            </button>
+            <UploadMoreButton onFiles={onUploadMore} className="w-full" />
+          </div>
         </div>
       </div>
 

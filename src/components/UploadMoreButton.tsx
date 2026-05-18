@@ -29,7 +29,7 @@ export function UploadMoreButton({
       <button
         type="button"
         onClick={() => inputRef.current?.click()}
-        className={className ?? VARIANT_CLASS[variant]}
+        className={[VARIANT_CLASS[variant], className].filter(Boolean).join(' ')}
       >
         {label}
       </button>

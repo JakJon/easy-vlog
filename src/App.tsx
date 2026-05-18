@@ -358,12 +358,12 @@ function App() {
         )}
 
         {phase.name === 'sorting' && (
-          <Progress
-            label="Getting ready..."
-            current={1}
-            total={phase.total}
-            ratio={0.5}
-          />
+          <div className="rounded-2xl border border-neutral-200 bg-white px-8 py-12 text-center">
+            <h3 className="text-xl font-medium text-neutral-700">
+              Getting your {phase.total} {phase.total === 1 ? 'item' : 'items'}{' '}
+              ready.
+            </h3>
+          </div>
         )}
 
         {phase.name === 'review' && diagnostics && (
@@ -467,7 +467,7 @@ function App() {
           className="cursor-pointer hover:text-neutral-600 transition-colors"
           aria-label="Toggle sort diagnostics"
         >
-          v1.5.3
+          v1.5.4
         </button>
       </footer>
     </div>
