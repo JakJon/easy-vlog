@@ -65,6 +65,23 @@ async function waitForGis(timeoutMs = 8_000): Promise<GoogleNamespace> {
   )
 }
 
+// Kick off GIS load as soon as this module is imported. By the time the user
+// clicks the sign-in button, gisLoaded is almost always set, which lets us
+// call requestAccessToken synchronously inside the click gesture — critical
+// for iOS Safari, which blocks popups opened after any microtask yield.
+let gisPromise: Promise<GoogleNamespace> | null = null
+let gisLoaded: GoogleNamespace | null = null
+function ensureGisLoading(): Promise<GoogleNamespace> {
+  if (!gisPromise) {
+    gisPromise = waitForGis()
+    gisPromise.then((g) => { gisLoaded = g }).catch(() => {})
+  }
+  return gisPromise
+}
+if (typeof window !== 'undefined') {
+  ensureGisLoading().catch(() => {})
+}
+
 // Request a fresh access token, opening Google's sign-in popup. Resolves with
 // the token string. Rejects if the user cancels or denies the scope.
 export async function getAccessToken(forceConsent = false): Promise<string> {
@@ -72,8 +89,11 @@ export async function getAccessToken(forceConsent = false): Promise<string> {
     return cachedToken.value
   }
 
-  const gis = await waitForGis()
   const clientId = getClientId()
+  // Prefer the synchronously-available reference. Awaiting here would cross a
+  // microtask boundary and kill the iOS user-gesture context — so the OAuth
+  // popup would never open.
+  const gis = gisLoaded ?? await ensureGisLoading()
 
   return await new Promise<string>((resolve, reject) => {
     const tokenClient = gis.accounts.oauth2.initTokenClient({

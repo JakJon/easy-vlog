@@ -16,24 +16,13 @@ export function GooglePhotosButton({ onMetadata, onError, label }: Props) {
   const busy = progress != null
 
   const handleClick = async () => {
-    // Pre-open a blank window in the user gesture to dodge popup blockers.
-    const pickerWindow = window.open('about:blank', '_blank')
     setProgress({ phase: 'auth' })
     try {
-      const metadata = await pickMetadataFromGooglePhotos(
-        (p) => setProgress(p),
-        undefined,
-        pickerWindow,
-      )
+      const metadata = await pickMetadataFromGooglePhotos((p) => setProgress(p))
       setProgress(null)
       onMetadata(metadata)
     } catch (err) {
       setProgress(null)
-      try {
-        pickerWindow?.close()
-      } catch {
-        // ignore
-      }
       onError(err instanceof Error ? err.message : String(err))
     }
   }
@@ -52,25 +41,34 @@ export function GooglePhotosButton({ onMetadata, onError, label }: Props) {
     }
   })()
 
+  const showPickerLink = progress?.phase === 'waiting' && progress.pickerUri
+
   return (
-    <div className="flex flex-col items-center gap-2">
-      <button
-        type="button"
-        onClick={handleClick}
-        disabled={busy}
-        className="inline-flex items-center gap-2 rounded-full border border-neutral-200 bg-white px-6 py-3 text-sm font-medium text-neutral-700 hover:border-emerald-400 hover:text-emerald-600 disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
-      >
-        {buttonLabel}
-      </button>
-      {progress?.phase === 'waiting' && progress.pickerUri && (
+    <div className="flex flex-col items-center gap-3">
+      {showPickerLink ? (
         <a
           href={progress.pickerUri}
           target="_blank"
           rel="noopener noreferrer"
-          className="text-xs text-emerald-600 underline"
+          className="inline-flex items-center gap-2 rounded-full border border-emerald-500 bg-emerald-500 px-6 py-3 text-sm font-medium text-white hover:bg-emerald-400 hover:border-emerald-400 transition-colors"
         >
-          Picker didn't open? Tap here.
+          Open Google Photos picker
         </a>
+      ) : (
+        <button
+          type="button"
+          onClick={handleClick}
+          disabled={busy}
+          className="inline-flex items-center gap-2 rounded-full border border-neutral-200 bg-white px-6 py-3 text-sm font-medium text-neutral-700 hover:border-emerald-400 hover:text-emerald-600 disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
+        >
+          {buttonLabel}
+        </button>
+      )}
+      {showPickerLink && (
+        <p className="text-xs text-neutral-500 text-center max-w-xs">
+          Pick the same items in Google Photos, then return here — we&apos;ll
+          finish automatically.
+        </p>
       )}
     </div>
   )

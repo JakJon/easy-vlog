@@ -110,13 +110,16 @@ function filenameFor(item: PickedMediaItem): string {
 }
 
 // Main entrypoint. Drives the picker flow and returns just the metadata —
-// crucially, no MediaItem byte downloads happen here. `pickerWindow` is a
-// window the caller already opened synchronously inside the user's click
-// handler so the browser doesn't block the navigation as an unsolicited popup.
+// crucially, no MediaItem byte downloads happen here. The picker URL is
+// surfaced via the `waiting` progress event; the caller renders it as an
+// anchor link the user taps. We deliberately do NOT open the picker window
+// from here: programmatic `window.open` / `location.href` is blocked on iOS
+// Safari outside a user gesture, and on Android it bypasses the OS app-link
+// intent system (so the picker opens in the browser instead of the native
+// Google Photos app). A user-initiated anchor click respects both.
 export async function pickMetadataFromGooglePhotos(
   onProgress: (p: PickerProgress) => void,
   signal?: AbortSignal,
-  pickerWindow?: Window | null,
 ): Promise<PickerMetadata[]> {
   onProgress({ phase: 'auth' })
   const token = await getAccessToken()
@@ -128,18 +131,6 @@ export async function pickMetadataFromGooglePhotos(
     token,
   })
 
-  let opened: Window | null = null
-  if (pickerWindow && !pickerWindow.closed) {
-    try {
-      pickerWindow.location.href = session.pickerUri
-      opened = pickerWindow
-    } catch {
-      opened = null
-    }
-  }
-  if (!opened) {
-    opened = window.open(session.pickerUri, '_blank', 'noopener,noreferrer')
-  }
   onProgress({ phase: 'waiting', pickerUri: session.pickerUri })
 
   const pollSeconds = parsePollIntervalSeconds(session.pollingConfig?.pollInterval)
@@ -158,12 +149,6 @@ export async function pickMetadataFromGooglePhotos(
       finalSession = next
       break
     }
-  }
-
-  try {
-    opened?.close()
-  } catch {
-    // ignore
   }
 
   onProgress({ phase: 'listing' })
