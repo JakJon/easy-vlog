@@ -5,7 +5,7 @@ import { Options } from './components/Options'
 import { DiagnosticsPanel } from './components/DiagnosticsPanel'
 import { PickerMetadataPanel } from './components/PickerMetadataPanel'
 import { ReviewScreen } from './components/ReviewScreen'
-import { ReorderOptionsScreen } from './components/ReorderOptionsScreen'
+import { ReadyScreen } from './components/ReadyScreen'
 import { ManualReorder } from './components/ManualReorder'
 import { precachePreviews } from './components/Thumbnail'
 import { Progress } from './components/Progress'
@@ -26,51 +26,52 @@ import {
   type StitchOptions,
 } from './lib/types'
 
+function summarizeOptions(o: StitchOptions): string {
+  const orient = o.orientation === 'portrait' ? 'Portrait' : 'Landscape'
+  return `${orient} · ${o.imageDurationSeconds}s per photo`
+}
+
 function App() {
   const [phase, setPhase] = useState<AppPhase>({ name: 'idle' })
   const [options, setOptions] = useState<StitchOptions>(DEFAULT_STITCH_OPTIONS)
-  const [mobileOptionsOpen, setMobileOptionsOpen] = useState(false)
   const [diagnostics, setDiagnostics] = useState<SortDiagnosticRow[] | null>(null)
   const [showDiagnostics, setShowDiagnostics] = useState(false)
   const [lastMatchAttempt, setLastMatchAttempt] = useState<{
     pickerMetadata: PickerMetadata[]
     matchedCount: number
   } | null>(null)
-  // Stitching is async; capture the latest options at the moment upload starts
-  // so changes mid-flight don't retarget the in-progress encode.
-  const optionsRef = useRef(options)
-  optionsRef.current = options
   // Latest items used in the most recent stitch — needed when the user clicks
-  // Reorder on the done screen and we need the items list back to feed into
-  // the reorder phase (the done phase only carries blob+url).
+  // Edit > Sort on the done screen and we need the items list back.
   const lastItemsRef = useRef<MediaItem[] | null>(null)
-  // Snapshot of the done state taken just before entering reorder/reorder-options
-  // from done. Lets the Back arrow restore the previous video without re-stitching.
+  // Snapshot of the done state taken just before entering reorder from done.
+  // Lets the Back arrow restore the previous video without re-stitching.
   const savedDoneRef = useRef<{ blob: Blob; url: string } | null>(null)
   const webCodecsSupported = isWebCodecsSupported()
 
-  const runStitch = useCallback(async (items: MediaItem[]) => {
-    lastItemsRef.current = items
-    setPhase({
-      name: 'stitching',
-      total: items.length,
-      current: 0,
-      ratio: 0,
-    })
-    // Pre-extract thumbnails BEFORE the stitch reads (and on Android Chrome,
-    // detaches) the underlying Files. Without this, Manual Reorder opened
-    // after stitch shows IMG/VID placeholders because the originals are no
-    // longer readable. Cheap if the cache is already populated from the
-    // background precache kicked off in handleFiles.
-    await precachePreviews(items.map((it) => ({ file: it.file, kind: it.kind })))
-    const blob = await stitchMedia(items, optionsRef.current, ({ current, total, ratio }) => {
-      setPhase({ name: 'stitching', total, current, ratio })
-    })
-    const url = URL.createObjectURL(blob)
-    // We re-stitched, so the old saved-done snapshot is now obsolete. Drop it.
-    savedDoneRef.current = null
-    setPhase({ name: 'done', blob, url })
-  }, [])
+  const runStitch = useCallback(
+    async (items: MediaItem[], opts: StitchOptions) => {
+      lastItemsRef.current = items
+      setPhase({
+        name: 'stitching',
+        total: items.length,
+        current: 0,
+        ratio: 0,
+        options: opts,
+      })
+      // Pre-extract thumbnails BEFORE the stitch reads (and on Android Chrome,
+      // detaches) the underlying Files. Without this, Manual Reorder opened
+      // after stitch shows IMG/VID placeholders.
+      await precachePreviews(items.map((it) => ({ file: it.file, kind: it.kind })))
+      const blob = await stitchMedia(items, opts, ({ current, total, ratio }) => {
+        setPhase({ name: 'stitching', total, current, ratio, options: opts })
+      })
+      const url = URL.createObjectURL(blob)
+      // We re-stitched, so the old saved-done snapshot is now obsolete.
+      savedDoneRef.current = null
+      setPhase({ name: 'done', blob, url })
+    },
+    [],
+  )
 
   const reportError = useCallback((err: unknown) => {
     console.error(err)
@@ -88,65 +89,89 @@ function App() {
     setPhase({ name: 'error', message, details })
   }, [])
 
+  // Handle both initial upload (phase === 'idle') and "Upload more" from
+  // ready/review/done. Existing items are appended to, never replaced — that
+  // matches what the user asked for and the natural meaning of "more".
   const handleFiles = useCallback(
-    async (files: File[]) => {
+    async (newFiles: File[]) => {
       try {
-        setDiagnostics(null)
-        setLastMatchAttempt(null)
-        const heicCount = files.filter(isHeic).length
+        // Pull existing items + diagnostics from whatever phase we're in.
+        let currentItems: MediaItem[] = []
+        let currentDiag: SortDiagnosticRow[] = []
+        if (phase.name === 'ready' || phase.name === 'review') {
+          currentItems = phase.items
+          currentDiag = diagnostics ?? []
+        } else if (phase.name === 'done') {
+          currentItems = lastItemsRef.current ?? []
+          currentDiag = diagnostics ?? []
+        }
+
+        if (currentItems.length === 0) {
+          setLastMatchAttempt(null)
+        }
+
+        const heicCount = newFiles.filter(isHeic).length
         if (heicCount > 0) {
           setPhase({ name: 'converting', total: heicCount, current: 0 })
         }
-        const prepared = await convertHeicFiles(files, ({ current, total }) => {
+        const prepared = await convertHeicFiles(newFiles, ({ current, total }) => {
           setPhase({ name: 'converting', total, current })
         })
         setPhase({ name: 'sorting', total: prepared.length })
-        const { items, diagnostics: diag } = await buildMediaItems(prepared)
-        setDiagnostics(diag)
-        if (items.length === 0) {
+        const { items: newItems, diagnostics: newDiag } =
+          await buildMediaItems(prepared)
+
+        const combined = [...currentItems, ...newItems]
+        if (combined.length === 0) {
           setPhase({
             name: 'error',
             message: 'No supported images or videos found in your selection.',
           })
           return
         }
-        // Fire-and-forget: start pre-extracting thumbnails now so they're
-        // ready by the time Manual Reorder opens. runStitch awaits the same
-        // promise via cache dedup before it touches the originals.
-        void precachePreviews(items.map((it) => ({ file: it.file, kind: it.kind })))
-        const unreliableCount = diag.filter((d) => d.source === 'lastModified').length
+
+        // Re-index diagnostics so order matches the combined items list.
+        const combinedDiag: SortDiagnosticRow[] = [
+          ...currentDiag.map((d, i) => ({ ...d, order: i })),
+          ...newDiag.map((d, i) => ({
+            ...d,
+            order: currentItems.length + i,
+          })),
+        ]
+        setDiagnostics(combinedDiag)
+
+        // Fire-and-forget thumbnail precache for Manual Reorder.
+        void precachePreviews(
+          combined.map((it) => ({ file: it.file, kind: it.kind })),
+        )
+        // The set of items just changed — any saved Done snapshot is stale.
+        savedDoneRef.current = null
+
+        const unreliableCount = combinedDiag.filter(
+          (d) => d.source === 'lastModified',
+        ).length
         if (unreliableCount > 0) {
-          setPhase({ name: 'review', items, unreliableCount })
-          return
+          setPhase({ name: 'review', items: combined, unreliableCount })
+        } else {
+          setPhase({ name: 'ready', items: combined })
         }
-        await runStitch(items)
       } catch (err) {
         reportError(err)
       }
     },
-    [runStitch, reportError],
+    [phase, diagnostics, reportError],
   )
 
   const handleMatched = useCallback(
     async (metadata: PickerMetadata[]) => {
-      // Smart Sort can be triggered from either the initial review screen
-      // (when uploads contain unreliable timestamps) or from the reorder-options
-      // screen (when the user clicked Reorder on the done view).
-      if (phase.name !== 'review' && phase.name !== 'reorder-options') return
+      if (phase.name !== 'review') return
       try {
         const allFiles = phase.items.map((it) => it.file)
-        // Review: only match unreliable items to avoid clobbering correct
-        // EXIF photos. Reorder-options: trust the user's explicit ask and
-        // match against ALL files — they wanted Google's dates applied.
-        let filesToMatch: File[]
-        if (phase.name === 'reorder-options') {
-          filesToMatch = allFiles
-        } else {
-          filesToMatch = []
-          for (let i = 0; i < phase.items.length; i++) {
-            if (diagnostics?.[i]?.source === 'lastModified') {
-              filesToMatch.push(phase.items[i].file)
-            }
+        // Only match unreliable items — don't clobber correct EXIF photos.
+        const filesToMatch: File[] = []
+        for (let i = 0; i < phase.items.length; i++) {
+          if (diagnostics?.[i]?.source === 'lastModified') {
+            filesToMatch.push(phase.items[i].file)
           }
         }
         const known = matchFilesToPickerMetadata(filesToMatch, metadata)
@@ -157,73 +182,75 @@ function App() {
         const { items, diagnostics: diag } = await buildMediaItems(allFiles, known)
         setDiagnostics(diag)
 
-        if (phase.name === 'reorder-options') {
-          // User explicitly chose to reorder — re-stitch immediately, no review.
-          await runStitch(items)
-          return
-        }
-
-        // Review path: branch on remaining unreliable count.
-        const stillUnreliable = diag.filter((d) => d.source === 'lastModified').length
+        const stillUnreliable = diag.filter(
+          (d) => d.source === 'lastModified',
+        ).length
         if (stillUnreliable > 0) {
           setPhase({ name: 'review', items, unreliableCount: stillUnreliable })
           return
         }
-        await runStitch(items)
+        // All resolved — proceed to Ready (user explicitly clicks Start to stitch).
+        setPhase({ name: 'ready', items })
       } catch (err) {
         reportError(err)
       }
     },
-    [phase, diagnostics, runStitch, reportError],
+    [phase, diagnostics, reportError],
   )
 
+  // From the Hmm pane: skip sorting and stitch as-is. This is the explicit
+  // escape hatch — we don't route through Ready because the user just clicked
+  // "Continue anyway" to bypass it.
   const handleStitchAnyway = useCallback(async () => {
     if (phase.name !== 'review') return
     try {
-      await runStitch(phase.items)
+      await runStitch(phase.items, options)
     } catch (err) {
       reportError(err)
     }
-  }, [phase, runStitch, reportError])
+  }, [phase, options, runStitch, reportError])
 
-  // Enter manual reorder from the initial review screen.
+  const handleStartFromReady = useCallback(async () => {
+    if (phase.name !== 'ready') return
+    try {
+      await runStitch(phase.items, options)
+    } catch (err) {
+      reportError(err)
+    }
+  }, [phase, options, runStitch, reportError])
+
+  // Enter manual reorder from various sources.
   const handleManualReorder = useCallback(() => {
     if (phase.name !== 'review') return
     setPhase({ name: 'reorder', items: phase.items, from: 'review' })
   }, [phase])
 
-  // Enter manual reorder from the reorder-options screen.
-  const handleManualReorderFromOptions = useCallback(() => {
-    if (phase.name !== 'reorder-options') return
-    setPhase({ name: 'reorder', items: phase.items, from: 'reorder-options' })
+  const handleSortFromReady = useCallback(() => {
+    if (phase.name !== 'ready') return
+    setPhase({ name: 'reorder', items: phase.items, from: 'ready' })
   }, [phase])
 
-  // From the done screen, the Reorder button branches:
-  //   - if smart sort was already used in this session → straight to manual reorder
-  //   - otherwise → present the two-option screen first
-  const handleReorderFromDone = useCallback(() => {
+  // Edit > Sort on the Done screen — snapshot done state so the Back arrow
+  // can restore the existing video, then enter manual reorder.
+  const handleSortFromDone = useCallback(() => {
     if (phase.name !== 'done') return
     const items = lastItemsRef.current
     if (!items) return
-    // Snapshot current done state so the Back arrow can restore it without
-    // re-stitching.
     savedDoneRef.current = { blob: phase.blob, url: phase.url }
-    if (lastMatchAttempt) {
-      setPhase({ name: 'reorder', items, from: 'done' })
-    } else {
-      setPhase({ name: 'reorder-options', items })
-    }
-  }, [phase, lastMatchAttempt])
+    setPhase({ name: 'reorder', items, from: 'done' })
+  }, [phase])
 
   const handleManualOrderDone = useCallback(
     async (reordered: MediaItem[]) => {
       if (phase.name !== 'reorder') return
       // Synthesize monotonically-increasing timestamps to match the user's
       // chosen order — the stitch pipeline iterates items[] directly, so the
-      // exact timestamps only need to preserve order. Anchored at "now" so
-      // future re-sorts (if any) keep this set ahead of older anchors.
+      // exact values only need to preserve order.
       const base = Date.now()
-      const ordered = reordered.map((item, i) => ({ ...item, timestamp: base + i }))
+      const ordered = reordered.map((item, i) => ({
+        ...item,
+        timestamp: base + i,
+      }))
       const diag: SortDiagnosticRow[] = ordered.map((it, i) => ({
         order: i,
         kind: it.kind,
@@ -232,16 +259,24 @@ function App() {
         iso: new Date(it.timestamp).toISOString(),
       }))
       setDiagnostics(diag)
-      try {
-        await runStitch(ordered)
-      } catch (err) {
-        reportError(err)
+
+      if (phase.from === 'review') {
+        // Came from Hmm — user already declined extra steps, so re-stitch.
+        try {
+          await runStitch(ordered, options)
+        } catch (err) {
+          reportError(err)
+        }
+        return
       }
+      // 'ready' or 'done' (Edit menu) → return to Ready with the new order.
+      // The snapshotted Done becomes stale once we've changed the order.
+      savedDoneRef.current = null
+      setPhase({ name: 'ready', items: ordered })
     },
-    [phase, runStitch, reportError],
+    [phase, options, runStitch, reportError],
   )
 
-  // Back arrow on manual reorder routes by where the user came from.
   const handleManualReorderCancel = useCallback(() => {
     if (phase.name !== 'reorder') return
     switch (phase.from) {
@@ -249,21 +284,27 @@ function App() {
         const unreliable = diagnostics
           ? diagnostics.filter((d) => d.source === 'lastModified').length
           : phase.items.length
-        setPhase({ name: 'review', items: phase.items, unreliableCount: unreliable })
+        setPhase({
+          name: 'review',
+          items: phase.items,
+          unreliableCount: unreliable,
+        })
         return
       }
-      case 'reorder-options': {
-        setPhase({ name: 'reorder-options', items: phase.items })
+      case 'ready': {
+        setPhase({ name: 'ready', items: phase.items })
         return
       }
       case 'done': {
-        // Restore the snapshotted done state — saves a re-stitch.
         if (savedDoneRef.current) {
-          setPhase({ name: 'done', blob: savedDoneRef.current.blob, url: savedDoneRef.current.url })
+          setPhase({
+            name: 'done',
+            blob: savedDoneRef.current.blob,
+            url: savedDoneRef.current.url,
+          })
           savedDoneRef.current = null
           return
         }
-        // Shouldn't happen, but fall back to idle if the snapshot got dropped.
         setPhase({ name: 'idle' })
         return
       }
@@ -284,43 +325,10 @@ function App() {
         <Header />
 
         {phase.name === 'idle' && webCodecsSupported && (
-          <>
-            <UploadZone onFiles={handleFiles} />
-            <div className="hidden sm:block mt-4">
-              <Options value={options} onChange={setOptions} />
-            </div>
-            <div className="sm:hidden mt-4 rounded-2xl border border-neutral-200 bg-white">
-              <button
-                type="button"
-                onClick={() => setMobileOptionsOpen((v) => !v)}
-                aria-expanded={mobileOptionsOpen}
-                aria-controls="mobile-options-panel"
-                className="flex w-full items-center justify-between px-6 py-4 text-left"
-              >
-                <span className="text-sm font-medium text-neutral-700">
-                  Options
-                </span>
-                <span
-                  aria-hidden="true"
-                  className={`text-neutral-400 transition-transform duration-200 ${
-                    mobileOptionsOpen ? 'rotate-180' : ''
-                  }`}
-                >
-                  ▾
-                </span>
-              </button>
-              <div
-                id="mobile-options-panel"
-                className={`grid overflow-hidden transition-[grid-template-rows] duration-300 ease-out ${
-                  mobileOptionsOpen ? 'grid-rows-[1fr]' : 'grid-rows-[0fr]'
-                }`}
-              >
-                <div className="min-h-0 overflow-hidden">
-                  <Options value={options} onChange={setOptions} bare />
-                </div>
-              </div>
-            </div>
-          </>
+          <UploadZone
+            onFiles={handleFiles}
+            footer={<Options value={options} onChange={setOptions} bare />}
+          />
         )}
 
         {phase.name === 'idle' && !webCodecsSupported && (
@@ -364,19 +372,24 @@ function App() {
             unreliableCount={phase.unreliableCount}
             diagnostics={diagnostics}
             lastMatchAttempt={lastMatchAttempt}
+            options={options}
+            onOptionsChange={setOptions}
             onMatched={handleMatched}
             onManualReorder={handleManualReorder}
             onStitchAnyway={handleStitchAnyway}
+            onUploadMore={handleFiles}
             onError={(message) => setPhase({ name: 'error', message })}
           />
         )}
 
-        {phase.name === 'reorder-options' && (
-          <ReorderOptionsScreen
-            lastMatchAttempt={lastMatchAttempt}
-            onMatched={handleMatched}
-            onManualReorder={handleManualReorderFromOptions}
-            onError={(message) => setPhase({ name: 'error', message })}
+        {phase.name === 'ready' && (
+          <ReadyScreen
+            itemCount={phase.items.length}
+            options={options}
+            onOptionsChange={setOptions}
+            onStart={handleStartFromReady}
+            onSort={handleSortFromReady}
+            onUploadMore={handleFiles}
           />
         )}
 
@@ -398,6 +411,7 @@ function App() {
             current={phase.current}
             total={phase.total}
             ratio={phase.ratio}
+            optionsSummary={summarizeOptions(phase.options)}
           />
         )}
 
@@ -406,7 +420,8 @@ function App() {
             videoUrl={phase.url}
             onSave={() => saveBlob(phase.blob, 'easy-vlog.mp4')}
             onReset={reset}
-            onReorder={handleReorderFromDone}
+            onSort={handleSortFromDone}
+            onUploadMore={handleFiles}
           />
         )}
 
@@ -452,7 +467,7 @@ function App() {
           className="cursor-pointer hover:text-neutral-600 transition-colors"
           aria-label="Toggle sort diagnostics"
         >
-          v1.5.2
+          v1.5.3
         </button>
       </footer>
     </div>

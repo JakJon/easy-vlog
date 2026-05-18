@@ -26,14 +26,16 @@ export type AppPhase =
   | { name: 'converting'; total: number; current: number }
   | { name: 'sorting'; total: number }
   | { name: 'review'; items: MediaItem[]; unreliableCount: number }
+  | { name: 'ready'; items: MediaItem[] }
   | {
       name: 'reorder'
       items: MediaItem[]
-      // Where the user came from. Determines what the Back arrow does.
-      from: 'review' | 'reorder-options' | 'done'
+      // Where the user came from. Determines Back / Save behavior.
+      //   'review' → Save re-stitches, Back returns to review.
+      //   'ready'  → Save returns to ready with new order, Back returns to ready.
+      //   'done'   → Save returns to ready with new order, Back restores done snapshot.
+      from: 'review' | 'ready' | 'done'
     }
-  | { name: 'reorder-options'; items: MediaItem[] }
-  | { name: 'matching'; pickerPhase: string; pickerUri?: string }
-  | { name: 'stitching'; total: number; current: number; ratio: number }
+  | { name: 'stitching'; total: number; current: number; ratio: number; options: StitchOptions }
   | { name: 'done'; blob: Blob; url: string }
   | { name: 'error'; message: string; details?: string }

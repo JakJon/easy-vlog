@@ -3,9 +3,12 @@ interface Props {
   current: number
   total: number
   ratio: number
+  // Optional read-only summary of the options driving this run — shown beneath
+  // the progress bar during stitching so the user can see what they chose.
+  optionsSummary?: string
 }
 
-export function Progress({ label, current, total, ratio }: Props) {
+export function Progress({ label, current, total, ratio, optionsSummary }: Props) {
   const overall = total === 0 ? 0 : Math.max(0, Math.min(1, ((current - 1) + ratio) / total))
   const pct = Math.round(overall * 100)
 
@@ -23,6 +26,10 @@ export function Progress({ label, current, total, ratio }: Props) {
         />
       </div>
       <p className="mt-3 text-sm font-medium text-emerald-600">{pct}%</p>
+
+      {optionsSummary && (
+        <p className="mt-6 text-xs text-neutral-500">{optionsSummary}</p>
+      )}
     </div>
   )
 }
