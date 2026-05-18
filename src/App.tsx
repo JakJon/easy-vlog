@@ -257,6 +257,7 @@ function App() {
         name: it.file.name,
         source: 'google-photos',
         iso: new Date(it.timestamp).toISOString(),
+        sizeBytes: it.file.size,
       }))
       setDiagnostics(diag)
 
@@ -467,7 +468,7 @@ function App() {
           className="cursor-pointer hover:text-neutral-600 transition-colors"
           aria-label="Toggle sort diagnostics"
         >
-          v1.5.4
+          v1.5.5
         </button>
       </footer>
     </div>

@@ -11,7 +11,13 @@
       "WebSearch",
       "Bash(nslookup -type=NS easy-vlog.com)",
       "Bash(whois easy-vlog.com)",
-      "WebFetch(domain:rdap.verisign.com)"
+      "WebFetch(domain:rdap.verisign.com)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:kevinnadro.com)",
+      "Bash(where exiftool *)",
+      "Bash(where ffprobe *)",
+      "Bash(where mp4box *)",
+      "Bash(where ffmpeg *)"
     ]
   }
 }

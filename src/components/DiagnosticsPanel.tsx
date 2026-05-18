@@ -9,10 +9,10 @@ export function DiagnosticsPanel({ rows }: Props) {
   const [copied, setCopied] = useState(false)
 
   const asText = rows
-    .map(
-      (r) =>
-        `${String(r.order).padStart(2, '0')}  ${r.kind.padEnd(5)}  ${r.source.padEnd(13)}  ${r.iso}  ${r.name}`,
-    )
+    .map((r) => {
+      const sizeMB = (r.sizeBytes / (1024 * 1024)).toFixed(1).padStart(6) + ' MB'
+      return `${String(r.order).padStart(2, '0')}  ${r.kind.padEnd(5)}  ${r.source.padEnd(16)}  ${sizeMB}  ${r.iso}  ${r.name}`
+    })
     .join('\n')
 
   const copy = async () => {
@@ -52,7 +52,7 @@ export function DiagnosticsPanel({ rows }: Props) {
           {copied ? 'Copied!' : 'Copy table'}
         </button>
         <pre className="overflow-x-auto whitespace-pre rounded-lg bg-neutral-50 p-3 text-[11px] leading-tight text-neutral-700 select-all">
-{`order  kind   source         iso                       name
+{`order  kind   source            size       iso                       name
 ${asText}`}
         </pre>
       </div>
