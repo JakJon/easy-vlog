@@ -40,6 +40,72 @@ export async function stitchMedia(
   const imageDurationSeconds = Math.max(0.1, options.imageDurationSeconds)
   const imageVideoFrames = Math.max(1, Math.round(TARGET_FPS * imageDurationSeconds))
 
+  const errBox: AsyncErrorBox = { err: null }
+  const propagate = (e: unknown) => {
+    if (!errBox.err) errBox.err = e instanceof Error ? e : new Error(String(e))
+    console.error('[webcodecs]', e)
+  }
+
+  // --- Audio config probing (must happen BEFORE muxer creation) -------------
+  //
+  // Three things to nail down before we create the muxer:
+  //
+  //   (a) Force the AAC bitstream format to 'aac' (raw frames) instead of
+  //       'adts'. WebCodecs spec defaults to 'aac' but Safari has been
+  //       observed to behave inconsistently — explicit beats implicit.
+  //   (b) Use whatever AudioEncoder.isConfigSupported NORMALIZES the config
+  //       to as the muxer's audio config. If Safari downsamples 48kHz → 24kHz
+  //       silently, the muxer's audio track header would lie about the data
+  //       and iOS playback would refuse to render it.
+  //   (c) Derive the AOT from the normalized codec string so we know what
+  //       AudioSpecificConfig to write. mp4-muxer's auto-synth hardcodes
+  //       AOT=2 (AAC-LC); if Safari quietly negotiated HE-AAC, that mismatch
+  //       would also produce a "valid but silent" output.
+  type AacEncoderConfig = AudioEncoderConfig & { aac?: { format: 'aac' | 'adts' } }
+  const requestedAudioConfig: AacEncoderConfig = {
+    codec: TARGET_AUDIO_CODEC,
+    sampleRate: TARGET_SAMPLE_RATE,
+    numberOfChannels: TARGET_AUDIO_CHANNELS,
+    bitrate: TARGET_AUDIO_BITRATE,
+    aac: { format: 'aac' }, // force raw AAC frames
+  }
+  let audioEncSupport = await AudioEncoder.isConfigSupported(requestedAudioConfig)
+  // Safari may reject the explicit format hint. Retry without it.
+  if (!audioEncSupport.supported || !audioEncSupport.config) {
+    const fallback: AacEncoderConfig = { ...requestedAudioConfig }
+    delete fallback.aac
+    diagLog('warn', `[audio] AAC config with format:'aac' rejected; retrying without`)
+    audioEncSupport = await AudioEncoder.isConfigSupported(fallback)
+  }
+  if (!audioEncSupport.supported || !audioEncSupport.config) {
+    diagLog(
+      'error',
+      `[audio] AudioEncoder.isConfigSupported rejected ${TARGET_AUDIO_CODEC} @ ${TARGET_SAMPLE_RATE}Hz × ${TARGET_AUDIO_CHANNELS}ch`,
+      audioEncSupport,
+    )
+    throw new Error(
+      `Audio encoding not supported on this browser (AAC). Try Chrome/Edge on desktop.`,
+    )
+  }
+  const normalizedCfg = audioEncSupport.config
+  const normalizedRate = normalizedCfg.sampleRate ?? TARGET_SAMPLE_RATE
+  const normalizedChannels = normalizedCfg.numberOfChannels ?? TARGET_AUDIO_CHANNELS
+  const aotMatch = /^mp4a\.40\.(\d+)$/.exec(normalizedCfg.codec ?? '')
+  const normalizedAot = aotMatch ? parseInt(aotMatch[1], 10) : 2
+  diagLog(
+    'info',
+    `[audio] AudioEncoder normalized: codec=${normalizedCfg.codec} aot=${normalizedAot} rate=${normalizedRate}Hz ch=${normalizedChannels} bitrate=${normalizedCfg.bitrate}` +
+      (normalizedRate !== TARGET_SAMPLE_RATE || normalizedChannels !== TARGET_AUDIO_CHANNELS
+        ? ` (DIFFERS from requested ${TARGET_SAMPLE_RATE}Hz × ${TARGET_AUDIO_CHANNELS}ch — muxer will use normalized)`
+        : ''),
+  )
+  const synthesizedDesc = synthesizeAacAsc(normalizedAot, normalizedRate, normalizedChannels)
+  const synthDescHex = Array.from(synthesizedDesc)
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join(' ')
+  diagLog('info', `[audio] synthesized AOT=${normalizedAot} ASC: ${synthesizedDesc.byteLength}B [${synthDescHex}]`)
+
+  // --- Muxer (now uses normalized audio values) -----------------------------
   const muxer = new Muxer({
     target: new ArrayBufferTarget(),
     fastStart: 'in-memory',
@@ -51,16 +117,10 @@ export async function stitchMedia(
     },
     audio: {
       codec: 'aac',
-      sampleRate: TARGET_SAMPLE_RATE,
-      numberOfChannels: TARGET_AUDIO_CHANNELS,
+      sampleRate: normalizedRate,
+      numberOfChannels: normalizedChannels,
     },
   })
-
-  const errBox: AsyncErrorBox = { err: null }
-  const propagate = (e: unknown) => {
-    if (!errBox.err) errBox.err = e instanceof Error ? e : new Error(String(e))
-    console.error('[webcodecs]', e)
-  }
 
   const videoEncoder = new VideoEncoder({
     output: (chunk, meta) => {
@@ -82,18 +142,97 @@ export async function stitchMedia(
     avc: { format: 'avc' },
   })
 
+  // --- Audio encoder ---------------------------------------------------------
+  //
+  // AAC LC frames are always 1024 samples. At the normalized rate, that's
+  // a fixed per-chunk duration we can inject if Safari omits chunk.duration
+  // (a known WebKit issue — mp4-muxer reads chunk.duration directly to write
+  // stts deltas, so null/0 produces an audio track with zero-length samples
+  // that iOS playback silently skips).
+  const expectedFrameDurationUs = Math.round((1024 / normalizedRate) * 1_000_000)
+  let audioEncodeCallCount = 0
+  let audioEncoderChunkCount = 0
+  let audioEncoderChunkBytes = 0
+  let durationSynthesisCount = 0
+  let firstAudioChunkLogged = false
   const audioEncoder = new AudioEncoder({
     output: (chunk, meta) => {
-      muxer.addAudioChunk(chunk, meta)
+      audioEncoderChunkCount++
+      audioEncoderChunkBytes += chunk.byteLength
+
+      // Pin the description we send to mp4-muxer to one that matches the
+      // encoder's actual AOT/rate/channels. mp4-muxer's auto-synth always
+      // writes AOT=2; ours follows whatever Safari negotiated.
+      const patchedMeta: EncodedAudioChunkMetadata = {
+        ...meta,
+        decoderConfig: {
+          ...(meta?.decoderConfig ?? {}),
+          codec: normalizedCfg.codec ?? TARGET_AUDIO_CODEC,
+          sampleRate: normalizedRate,
+          numberOfChannels: normalizedChannels,
+          description: synthesizedDesc,
+        },
+      }
+
+      // Detect missing/zero duration. If Safari left it null, fill it in.
+      let effectiveDuration: number = chunk.duration ?? 0
+      const neededSynth = !effectiveDuration
+      if (neededSynth) {
+        effectiveDuration = expectedFrameDurationUs
+        durationSynthesisCount++
+      }
+
+      if (!firstAudioChunkLogged) {
+        firstAudioChunkLogged = true
+        // Peek at the first 16 bytes to inspect bitstream content. Raw AAC
+        // LC frames start with bits 001 0... (single channel element header
+        // SCE for mono, 010 for stereo CPE). ADTS frames would start FF F1
+        // (sync word). Anything else is a smoking gun.
+        const peekLen = Math.min(16, chunk.byteLength)
+        const peek = new Uint8Array(peekLen)
+        try {
+          chunk.copyTo(peek)
+        } catch {
+          /* fall through with zeros */
+        }
+        const hex = Array.from(peek)
+          .map((b) => b.toString(16).padStart(2, '0'))
+          .join(' ')
+        const isAdtsLike = peek[0] === 0xff && (peek[1] & 0xf0) === 0xf0
+        diagLog(
+          'info',
+          `[audio] first chunk: ${chunk.byteLength}B, type=${chunk.type}, ts=${chunk.timestamp}, duration=${chunk.duration}${neededSynth ? ` → synthesized ${effectiveDuration}us` : ''}; bytes=[${hex}]${isAdtsLike ? ' ⚠ LOOKS LIKE ADTS (FF F? sync)' : ''}; meta.description=${meta?.decoderConfig?.description ? `${(meta.decoderConfig.description as ArrayBufferView).byteLength}B from encoder` : 'NONE from encoder (using ours)'}`,
+        )
+      }
+
+      // mp4-muxer's addAudioChunk reads chunk.duration directly (chunk is
+      // read-only). To inject a synthesized duration, route through the
+      // public addAudioChunkRaw method with the data extracted up front.
+      if (neededSynth) {
+        const data = new Uint8Array(chunk.byteLength)
+        chunk.copyTo(data)
+        muxer.addAudioChunkRaw(
+          data,
+          chunk.type,
+          chunk.timestamp ?? 0,
+          effectiveDuration,
+          patchedMeta,
+        )
+      } else {
+        muxer.addAudioChunk(chunk, patchedMeta)
+      }
     },
     error: propagate,
   })
-  audioEncoder.configure({
-    codec: TARGET_AUDIO_CODEC,
-    sampleRate: TARGET_SAMPLE_RATE,
-    numberOfChannels: TARGET_AUDIO_CHANNELS,
-    bitrate: TARGET_AUDIO_BITRATE,
-  })
+  audioEncoder.configure(normalizedCfg)
+
+  // Wrap encode() so we can distinguish "encoder broken" (encode called but
+  // no chunks emitted) from "no audio reached the encoder" (encode not called).
+  const _rawEncode = audioEncoder.encode.bind(audioEncoder)
+  audioEncoder.encode = (d: AudioData) => {
+    audioEncodeCallCount++
+    _rawEncode(d)
+  }
 
   const canvas = new OffscreenCanvas(targetW, targetH)
   const ctx = canvas.getContext('2d', { alpha: false })
@@ -176,6 +315,10 @@ export async function stitchMedia(
     await videoEncoder.flush()
     await audioEncoder.flush()
     if (errBox.err) throw errBox.err
+    diagLog(
+      audioEncoderChunkCount > 0 ? 'info' : 'error',
+      `[audio] AudioEncoder totals: encode() called ${audioEncodeCallCount}× → ${audioEncoderChunkCount} chunks emitted (${audioEncoderChunkBytes} bytes). Duration synthesized for ${durationSynthesisCount}/${audioEncoderChunkCount} chunks.${audioEncoderChunkCount === 0 ? ' NO AUDIO will be in output — platform AAC encoder is broken.' : ''}`,
+    )
   } finally {
     try { videoEncoder.close() } catch { /* ignore */ }
     try { audioEncoder.close() } catch { /* ignore */ }
@@ -980,6 +1123,21 @@ async function extractMp4AudioSamples(
           offset += chunk.numberOfFrames
           chunk.close()
         }
+        // Sanity check: if all decoded samples are zero, then either the
+        // source was silent or AudioData.copyTo returned an empty buffer (a
+        // known iOS Safari WebCodecs quirk for some format/planeIndex combos).
+        // Either way, downstream silence is expected — log it so we know.
+        let peak = 0
+        for (const ch of channels) {
+          for (let i = 0; i < ch.length; i += 1024) {
+            const v = Math.abs(ch[i])
+            if (v > peak) peak = v
+          }
+        }
+        diagLog(
+          peak > 0.0001 ? 'info' : 'warn',
+          `[audio] decoded ${totalFrames} frames @ ${sourceRate}Hz × ${sourceChannels}ch; peak=${peak.toFixed(4)}${peak <= 0.0001 ? ' (samples appear to be silence — AudioData.copyTo may be misreading the format)' : ''}`,
+        )
         resolve({ channels, sampleRate: sourceRate, numberOfChannels: sourceChannels })
       } catch (e) {
         for (const c of decodedChunks) c.close()
@@ -1118,6 +1276,56 @@ function extractAudioSpecificConfig(
     if (dsi) return dsi
   }
   return undefined
+}
+
+// Synthesizes the AAC AudioSpecificConfig bytes for a given AudioObjectType
+// (2 = AAC-LC, 5 = HE-AAC, 29 = HE-AACv2), sample rate, and channel count.
+// We always write this into meta.decoderConfig.description so mp4-muxer's
+// esds box matches the encoder's actual output AOT — its built-in auto-synth
+// hardcodes AOT=2, which silently mismatches if Safari negotiated a different
+// profile.
+//
+// ASC bit layout:
+//   audioObjectType:        5 bits (or 5+6 if escape value 31 is used for AOTs >= 32)
+//   samplingFrequencyIndex: 4 bits (table lookup; 0xf = explicit rate follows)
+//   channelConfiguration:   4 bits
+//   GASpecificConfig:       3 bits (zero for plain AAC-LC/HE-AAC)
+//
+// For HE-AAC explicit signaling (AOT=5 or 29) the full ASC is more elaborate
+// (extension AOT, extension sampling frequency index, AAC-LC inner config).
+// We emit the simpler "implicit" form — most decoders, including iOS, infer
+// SBR/PS from the bitstream itself when the ASC is just AOT 5/29 + rate/ch.
+function synthesizeAacAsc(aot: number, sampleRate: number, channels: number): Uint8Array {
+  const freqTable = [
+    96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000,
+    11025, 8000, 7350,
+  ]
+  const freqIdx = freqTable.indexOf(sampleRate)
+  const channelConfig = Math.max(1, Math.min(7, channels))
+  const bits: number[] = []
+  const pushBits = (v: number, n: number) => {
+    for (let i = n - 1; i >= 0; i--) bits.push((v >> i) & 1)
+  }
+  if (aot < 32) {
+    pushBits(aot, 5)
+  } else {
+    pushBits(31, 5)
+    pushBits(aot - 32, 6)
+  }
+  if (freqIdx >= 0) {
+    pushBits(freqIdx, 4)
+  } else {
+    pushBits(0xf, 4)
+    pushBits(sampleRate, 24)
+  }
+  pushBits(channelConfig, 4)
+  pushBits(0, 3) // GASpecificConfig: frameLengthFlag/dependsOnCoreCoder/extensionFlag all 0
+  const byteCount = Math.ceil(bits.length / 8)
+  const buf = new Uint8Array(byteCount)
+  for (let i = 0; i < bits.length; i++) {
+    if (bits[i]) buf[i >> 3] |= 1 << (7 - (i & 7))
+  }
+  return buf
 }
 
 // Builds an ordered list of AudioDecoder codec strings to try. mp4box can

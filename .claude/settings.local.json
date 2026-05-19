@@ -17,7 +17,13 @@
       "Bash(where exiftool *)",
       "Bash(where ffprobe *)",
       "Bash(where mp4box *)",
-      "Bash(where ffmpeg *)"
+      "Bash(where ffmpeg *)",
+      "Bash(findstr \"version\")",
+      "WebFetch(domain:mediabunny.dev)",
+      "WebFetch(domain:discussions.apple.com)",
+      "Bash(gh api *)",
+      "Bash(gh search *)",
+      "WebFetch(domain:www.w3.org)"
     ]
   }
 }
