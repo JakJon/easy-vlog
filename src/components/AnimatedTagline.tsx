@@ -5,18 +5,17 @@ import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 // (defended, sealed, guarded, fluid, basic, prompt, nimble, etc.).
 const QUICK = [
   'quick', 'fast', 'swift', 'speedy', 'snappy', 'instant', 'rapid', 'zippy',
-  'agile', 'efficient',
+  'agile', 'nifty'
 ]
 
 const SIMPLE = [
   'simple', 'effortless', 'painless', 'intuitive', 'smooth', 'seamless',
-  'accessible', 'approachable', 'streamlined', 'automatic', 'foolproof',
-  'elegant', 'frictionless', 'natural',
+  'elegant', 'natural'
 ]
 
 const SECURE = [
-  'secure', 'safe', 'private', 'confidential', 'bulletproof', 'untouchable',
-  'anonymous', 'discreet', 'yours', 'personal', 'airtight', 'ironclad',
+  'secure', 'safe', 'private',
+  'anonymous', 'discreet', 'yours', 'personal'
 ]
 
 function pick<T>(arr: readonly T[]): T {
