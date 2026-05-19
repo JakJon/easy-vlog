@@ -856,18 +856,43 @@ async function extractMp4AudioSamples(
 
         void (async () => {
           try {
-            const baseCfg: AudioDecoderConfig = {
-              codec: audioTrack.codec,
-              sampleRate: sourceRate,
-              numberOfChannels: sourceChannels,
+            // mp4box sometimes reports the codec as the bare string 'mp4a'
+            // (no profile suffix). iOS Safari's AudioDecoder rejects that —
+            // it requires fully-qualified strings like 'mp4a.40.2' (AAC-LC),
+            // 'mp4a.40.5' (HE-AAC), or 'mp4a.40.29' (HE-AACv2). Derive the
+            // profile from the AudioSpecificConfig and try candidates in
+            // order; the first AudioDecoder.isConfigSupported hit wins.
+            const candidates = buildAacCodecCandidates(audioTrack.codec, description)
+            let chosen: AudioDecoderConfig | null = null
+            const failures: string[] = []
+            for (const codec of candidates) {
+              const baseCfg: AudioDecoderConfig = {
+                codec,
+                sampleRate: sourceRate,
+                numberOfChannels: sourceChannels,
+              }
+              const cfg = description ? { ...baseCfg, description } : baseCfg
+              try {
+                const r = await AudioDecoder.isConfigSupported(cfg)
+                if (r.supported && r.config) {
+                  chosen = r.config
+                  break
+                }
+                failures.push(`${codec}:unsupported`)
+              } catch (e) {
+                failures.push(`${codec}:${e instanceof Error ? e.message : String(e)}`)
+              }
             }
-            const cfg = description ? { ...baseCfg, description } : baseCfg
-            const r = await AudioDecoder.isConfigSupported(cfg)
-            if (!r.supported || !r.config) {
+            if (!chosen) {
               throw new Error(
-                `AudioDecoder rejected ${audioTrack.codec} @ ${sourceRate}Hz × ${sourceChannels}ch`,
+                `AudioDecoder rejected all candidates [${candidates.join(', ')}] @ ${sourceRate}Hz × ${sourceChannels}ch (${failures.join('; ')})`,
               )
             }
+            const chosenCodec = chosen.codec
+            diagLog(
+              'info',
+              `[audio] AudioDecoder configured: codec=${chosenCodec} (mp4box reported '${audioTrack.codec}')`,
+            )
             let loggedFormat = false
             decoderRef.current = new AudioDecoder({
               output: (data) => {
@@ -875,7 +900,7 @@ async function extractMp4AudioSamples(
                   loggedFormat = true
                   diagLog(
                     'info',
-                    `[audio] AudioDecoder output: codec=${audioTrack.codec} format=${data.format ?? 'undefined'} rate=${data.sampleRate}Hz ch=${data.numberOfChannels}`,
+                    `[audio] AudioDecoder output: codec=${chosenCodec} format=${data.format ?? 'undefined'} rate=${data.sampleRate}Hz ch=${data.numberOfChannels}`,
                   )
                 }
                 decodedChunks.push(data)
@@ -885,7 +910,7 @@ async function extractMp4AudioSamples(
                 diagLog('error', '[audio] AudioDecoder runtime error', e)
               },
             })
-            decoderRef.current.configure(r.config)
+            decoderRef.current.configure(chosen)
             configured = true
             for (const s of pendingSamples) decodeSample(s)
             pendingSamples.length = 0
@@ -1093,6 +1118,48 @@ function extractAudioSpecificConfig(
     if (dsi) return dsi
   }
   return undefined
+}
+
+// Builds an ordered list of AudioDecoder codec strings to try. mp4box can
+// report the codec as the bare string 'mp4a' (no profile suffix) for some
+// iPhone-recorded files; iOS Safari's AudioDecoder rejects bare 'mp4a' and
+// requires 'mp4a.40.X' with the AudioObjectType filled in. When we have the
+// AudioSpecificConfig bytes from esds we can read the AOT directly (top 5
+// bits of byte 0, with the AOT=31 escape encoding adding 6 more bits from
+// byte 1). When we don't, we fall back to a list of common AAC profiles so
+// at least ONE candidate is likely to be accepted by the platform decoder.
+function buildAacCodecCandidates(
+  reportedCodec: string,
+  description: Uint8Array | undefined,
+): string[] {
+  const candidates: string[] = []
+  const seen = new Set<string>()
+  const push = (s: string) => {
+    if (!seen.has(s)) {
+      seen.add(s)
+      candidates.push(s)
+    }
+  }
+  // 1. If mp4box gave us a fully-qualified string ('mp4a.40.2' etc.), try it first.
+  if (/^mp4a\.[0-9a-fA-F]+\.[0-9]+$/.test(reportedCodec)) push(reportedCodec)
+  // 2. Derive the codec string from the AudioSpecificConfig if available.
+  if (description && description.length > 0) {
+    let aot = (description[0] >> 3) & 0x1f
+    if (aot === 31 && description.length > 1) {
+      // Escape: real AOT = 32 + next 6 bits.
+      aot = 32 + (((description[0] & 0x07) << 3) | ((description[1] >> 5) & 0x07))
+    }
+    if (aot > 0) push(`mp4a.40.${aot}`)
+  }
+  // 3. Common AAC profile fallbacks. AAC-LC first (most files), then HE-AAC v1
+  //    and v2, then xHE-AAC. iPhone recordings are almost always AAC-LC.
+  push('mp4a.40.2')
+  push('mp4a.40.5')
+  push('mp4a.40.29')
+  push('mp4a.40.42')
+  // 4. Last resort: the bare string mp4box reported. Some browsers accept it.
+  push(reportedCodec)
+  return candidates
 }
 
 function parseEsdsDescriptors(b: Uint8Array): Uint8Array | undefined {
