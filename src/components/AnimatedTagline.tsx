@@ -25,7 +25,7 @@ function pick<T>(arr: readonly T[]): T {
 const FADE_IN_MS = 280
 const EASY_IN_MS = 700
 const HOLD_MS = 500
-const BLOW_MS = 1200
+const BLOW_MS = 1000
 
 type Phase = 'in' | 'hold' | 'blow'
 
