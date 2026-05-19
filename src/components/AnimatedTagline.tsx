@@ -43,8 +43,31 @@ export function AnimatedTagline() {
   const [index, setIndex] = useState(0)
   const [phase, setPhase] = useState<Phase>('in')
   const displaceRef = useRef<SVGFEDisplacementMapElement>(null)
+  const sizerRef = useRef<HTMLSpanElement>(null)
+  const easyMeasureRef = useRef<HTMLSpanElement>(null)
+  const [wrapperWidth, setWrapperWidth] = useState<number | undefined>(undefined)
+  const [transitionsReady, setTransitionsReady] = useState(false)
 
   const isLast = index === 3
+
+  // Lock the wrapper to the longest word's width on mount so the centered
+  // tagline doesn't jitter as cycling words change length.
+  useLayoutEffect(() => {
+    if (!sizerRef.current) return
+    setWrapperWidth(sizerRef.current.offsetWidth)
+    // Defer enabling transitions until after the explicit width is committed,
+    // otherwise the initial auto → fixed change could try to animate.
+    const id = requestAnimationFrame(() => setTransitionsReady(true))
+    return () => cancelAnimationFrame(id)
+  }, [])
+
+  // Once Easy lands and enters hold, shrink the wrapper to Easy's natural
+  // width. text-center on the parent paragraph then re-centers the whole
+  // "Vlog editing made Easy." as a single horizontally-centered unit.
+  useLayoutEffect(() => {
+    if (!isLast || phase !== 'hold' || !easyMeasureRef.current) return
+    setWrapperWidth(easyMeasureRef.current.offsetWidth)
+  }, [isLast, phase])
 
   // Sequential phase machine: each word goes in → hold → blow → next.
   // Easy stops at 'hold' so it stays displayed permanently.
@@ -146,12 +169,33 @@ export function AnimatedTagline() {
       Vlog editing made{' '}
       <span
         className="relative inline-block align-baseline"
-        style={{ whiteSpace: 'nowrap' }}
+        style={{
+          whiteSpace: 'nowrap',
+          width: wrapperWidth !== undefined ? `${wrapperWidth}px` : 'auto',
+          transition: transitionsReady
+            ? 'width 700ms cubic-bezier(.4,0,.2,1)'
+            : 'none',
+        }}
       >
-        {/* Invisible sizer — locks wrapper width to the longest word in this
-            session so the centered tagline never re-flows horizontally. */}
-        <span style={{ visibility: 'hidden' }} aria-hidden>
+        {/* Invisible sizer — provides the wrapper's initial measured width
+            and its layout height. Once an explicit pixel width is set, this
+            content overflows the wrapper but stays invisible. */}
+        <span ref={sizerRef} style={{ visibility: 'hidden' }} aria-hidden>
           {longestWord}
+        </span>
+        {/* Off-flow measurer for Easy's natural width. Absolutely positioned
+            so it doesn't affect layout — purely for offsetWidth lookup. */}
+        <span
+          ref={easyMeasureRef}
+          aria-hidden
+          style={{
+            position: 'absolute',
+            visibility: 'hidden',
+            whiteSpace: 'nowrap',
+            pointerEvents: 'none',
+          }}
+        >
+          Easy.
         </span>
         {/* Single active span. Key includes phase so React remounts (and
             restarts the animation) on every phase change. */}
